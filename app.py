@@ -1998,7 +1998,7 @@ with tab11:
                 if not available_fonts:
                     st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
-# ----------- Tab12: گزارش زیست‌محیطی (داره، تغییر فونت) -----------
+# ----------- Tab12: گزارش زیست‌محیطی (اصلاح‌شده و سازگار با Cloud) -----------
 with tab12:
     st.subheader("🌍 گزارش زیست‌محیطی و پایداری")
 
@@ -2028,6 +2028,7 @@ with tab12:
             key="reduction_target"
         )
 
+        # ---------------- محاسبات CO2 ----------------
         df_env = filtered_df[["تاریخ", "تاریخ شمسی"] + env_cols].copy()
         for col in env_cols:
             df_env[f"CO2_{col}"] = df_env[col] * 1000 * co2_factor
@@ -2035,6 +2036,7 @@ with tab12:
         co2_columns = [f"CO2_{col}" for col in env_cols]
         df_env["CO2_Total"] = df_env[co2_columns].sum(axis=1)
 
+        # ---------------- نمودار روند ----------------
         fig_co2 = px.line(
             df_env,
             x="تاریخ",
@@ -2050,6 +2052,7 @@ with tab12:
         )
         st.plotly_chart(fig_co2, use_container_width=True)
 
+        # ---------------- نمودار دایره‌ای ----------------
         co2_totals = df_env[co2_columns].sum().reset_index()
         co2_totals.columns = ["تجهیز" if lang_mode=="fa" else "Equipment", "CO2 (kg)"]
         co2_totals["تجهیز" if lang_mode=="fa" else "Equipment"] = co2_totals[
@@ -2064,6 +2067,7 @@ with tab12:
         )
         st.plotly_chart(fig_pie, use_container_width=True)
 
+        # ---------------- تحلیل پایداری ----------------
         total_co2 = df_env["CO2_Total"].sum()
         target_co2 = total_co2 * (1 - reduction_target / 100)
         st.markdown("### 🔎 تحلیل پایداری" if lang_mode=="fa" else "### 🔎 Sustainability Analysis")
@@ -2085,13 +2089,38 @@ with tab12:
             else:
                 st.success("✅ Current emissions are within the reduction target!")
 
+        # ---------------- تولید فایل HTML برای مرورگر ----------------
+        import io, plotly.io as pio
+        html_buf_co2 = io.BytesIO()
+        pio.write_html(fig_co2, file=html_buf_co2, include_plotlyjs='cdn', full_html=False)
+        html_buf_co2.seek(0)
+        st.download_button(
+            label="📥 دانلود نمودار CO₂ (HTML)" if lang_mode=="fa" else "📥 Download CO₂ Chart (HTML)",
+            data=html_buf_co2,
+            file_name="CO2_chart.html",
+            mime="text/html"
+        )
+
+        html_buf_pie = io.BytesIO()
+        pio.write_html(fig_pie, file=html_buf_pie, include_plotlyjs='cdn', full_html=False)
+        html_buf_pie.seek(0)
+        st.download_button(
+            label="📥 دانلود نمودار دایره‌ای (HTML)" if lang_mode=="fa" else "📥 Download Pie Chart (HTML)",
+            data=html_buf_pie,
+            file_name="CO2_PieChart.html",
+            mime="text/html"
+        )
+
+        # ---------------- تولید گزارش PDF (بدون نمودار تصویری) ----------------
         st.markdown("### 📝 تولید گزارش PDF" if lang_mode=="fa" else "### 📝 Generate PDF Report")
         buffer = io.BytesIO()
         elements = []
 
-        elements.append(Paragraph("گزارش زیست‌محیطی و پایداری" if lang_mode=="fa" else "Environmental & Sustainability Report", ParagraphStyle('Title', alignment=1 if lang_mode=="fa" else 0)))
+        title_text = "گزارش زیست‌محیطی و پایداری" if lang_mode=="fa" else "Environmental & Sustainability Report"
+        elements.append(Paragraph(title_text, ParagraphStyle('Title', alignment=1 if lang_mode=="fa" else 0)))
         elements.append(Spacer(1, 12))
 
+        # جدول خلاصه
         if lang_mode == "fa":
             summary_data = [
                 ["معیار", "مقدار"],
@@ -2108,11 +2137,9 @@ with tab12:
                 ["Emission Factor (kg CO2/kWh)", f"{co2_factor:.2f}"],
                 ["Reduction Target (%)", f"{reduction_target:.1f}"]
             ]
-
         table_summary = Table(summary_data)
         table_summary.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
             ("GRID", (0, 0), (-1, -1), 1, colors.black),
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ]))
@@ -2120,15 +2147,14 @@ with tab12:
         elements.append(Spacer(1, 12))
         elements.append(table_summary)
 
+        # جدول انتشار هر تجهیز
         if lang_mode == "fa":
             equipment_data = [["تجهیز", "انتشار CO2 (kg)"]] + co2_totals.values.tolist()
         else:
             equipment_data = [["Equipment", "CO2 (kg)"]] + co2_totals.values.tolist()
-
         table_equipment = Table(equipment_data)
         table_equipment.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
             ("GRID", (0, 0), (-1, -1), 1, colors.black),
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ]))
@@ -2137,40 +2163,21 @@ with tab12:
         elements.append(Spacer(1, 12))
         elements.append(table_equipment)
 
-        # اضافه کردن نمودارها به PDF
-        img_buf_co2 = io.BytesIO()
-        import io
-
-# ایجاد بایت‌استریم از تصویر بدون نیاز به Kaleido
-        img_buf_co2 = io.BytesIO()
-        img_bytes = fig_co2.to_image(format="png", width=800, height=500, scale=2)
-        img_buf_co2.write(img_bytes)
-        img_buf_co2.seek(0)
-        img_buf_co2.seek(0)
-        elements.append(Image(img_buf_co2, width=500, height=300))
-
-        img_buf_pie = io.BytesIO()
-        fig_pie.write_image(img_buf_pie, format='png', width=800, height=500, scale=2)
-        img_buf_pie.seek(0)
-        elements.append(Image(img_buf_pie, width=500, height=300))
-
         title = "گزارش زیست‌محیطی"
         if not use_persian:
             title = translations.get(title, title)
         generate_pdf(title, elements, buffer)
 
-        # 👈 دانلود با getvalue() برای اطمینان
-        pdf_data = buffer.getvalue()
         st.download_button(
             label="⬇️ دانلود گزارش زیست‌محیطی (PDF)" if lang_mode=="fa" else "⬇️ Download Environmental Report (PDF)",
-            data=pdf_data,
+            data=buffer.getvalue(),
             file_name="گزارش_زیست_محیطی.pdf" if lang_mode=="fa" else "Environmental_Report.pdf",
             mime="application/pdf"
         )
-        
-        # چک فونت
+
         if not available_fonts:
             st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+
 
 # ----------- Tab13: مقایسه با استانداردها -----------
 with tab13:
