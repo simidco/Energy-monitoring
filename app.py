@@ -2139,7 +2139,13 @@ with tab12:
 
         # اضافه کردن نمودارها به PDF
         img_buf_co2 = io.BytesIO()
-        fig_co2.write_image(img_buf_co2, format='png', width=800, height=500, scale=2)
+        import io
+
+# ایجاد بایت‌استریم از تصویر بدون نیاز به Kaleido
+        img_buf_co2 = io.BytesIO()
+        img_bytes = fig_co2.to_image(format="png", width=800, height=500, scale=2)
+        img_buf_co2.write(img_bytes)
+        img_buf_co2.seek(0)
         img_buf_co2.seek(0)
         elements.append(Image(img_buf_co2, width=500, height=300))
 
