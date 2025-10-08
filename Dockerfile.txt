@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# نصب پیش‌نیازها
+COPY requirements.txt .
+RUN apt-get update && apt-get install -y build-essential libmagic1 && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt
+
+# کپی کل پروژه
+COPY . .
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501", "--server.enableCORS", "false", "--server.headless", "true"]
