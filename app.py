@@ -14,7 +14,6 @@ import numpy as np
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
-from reportlab.lib import colors
 import io
 import streamlit as st
 from reportlab.lib.pagesizes import A4
@@ -33,6 +32,20 @@ from prophet import Prophet
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from pulp import *
+import plotly.io as pio  # 👈 اضافه برای HTML export
+
+# 👈 چک محیط (cloud vs local)
+IS_CLOUD = os.getenv('STREAMLIT_SERVER_HEADLESS') == '1' or 'streamlit.io' in os.getenv('STREAMLIT_SERVER_ADDRESS', '')
+
+# 👈 RTL libs چک
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    RTL_AVAILABLE = True
+except ImportError:
+    RTL_AVAILABLE = False
+    st.warning("برای RTL بهتر، pip install arabic-reshaper python-bidi")
+
 # بررسی کتابخانه‌ها
 required_libraries = [
     "streamlit", "pandas", "plotly", "matplotlib", "seaborn",
@@ -50,7 +63,7 @@ def check_libraries():
 
 check_libraries()
 
-st.set_page_config(page_title="داشبورد پایش برق کنسانتره", layout="wide")
+st.set_page_config(page_title="داشبورد پایش برق کنسانتره", layout="wide")  # 👈 layout="wide" معادل use_container_width=True
 
 # ----------- پس‌زمینه و فونت -----------
 page_bg_img = '''
@@ -64,6 +77,7 @@ page_bg_img = '''
     font-family: Tahoma, Vazir, sans-serif;
     font-size: 16px;
 }
+[data-testid="stMarkdownContainer"] { direction: rtl; }  # 👈 RTL global
 </style>
 '''
 st.markdown(page_bg_img, unsafe_allow_html=True)
@@ -131,17 +145,20 @@ def load_excel(file):
             df_data["تاریخ"] = df_data["تاریخ"].apply(parse_jalali_date)
             log_messages.append(f"📅 تاریخ‌های شیت {sheet} به‌عنوان تاریخ شمسی پردازش شدند.")
         else:
-            df_data["تاریخ"] = pd.to_datetime(df_data["تاریخ"], errors="coerce")
+            # 👈 Fix UserWarning: specify format
+            df_data["تاریخ"] = pd.to_datetime(df_data["تاریخ"], format='%Y/%m/%d', errors="coerce")  # 👈 format اضافه
 
-        df_data = df_data.dropna(subset=["تاریخ"])
+        # 👈 Fix SettingWithCopyWarning: explicit copy
+        df_data = df_data.dropna(subset=["تاریخ"]).copy()  # 👈 .copy() اضافه
         if df_data.empty:
             log_messages.append(f"⚠️ شیت {sheet} پس از حذف تاریخ‌های نامعتبر خالی است.")
             continue
 
         df_data["تاریخ شمسی"] = df_data["تاریخ"].map(lambda x: JalaliDate(x).strftime('%Y/%m/%d') if pd.notnull(x) else "")
+        # 👈 Fix SettingWithCopyWarning: .loc for numeric
         for col in df_data.columns:
             if col not in ["تاریخ", "تاریخ شمسی"]:
-                df_data[col] = pd.to_numeric(df_data[col], errors="coerce")
+                df_data.loc[:, col] = pd.to_numeric(df_data[col], errors="coerce")  # 👈 .loc اضافه
         df_data["کارخانه"] = sheet
         dfs.append(df_data)
 
@@ -318,13 +335,8 @@ def generate_pdf(title, elements, buffer, pagesize=A4):
             normal_style = ParagraphStyle('Normal', fontName=font_name, fontSize=12, alignment=1)  # RTL
             
             # RTL reshape عنوان
-            try:
-                import arabic_reshaper
-                from bidi.algorithm import get_display
+            if RTL_AVAILABLE:
                 title = get_display(arabic_reshaper.reshape(title))
-            except ImportError:
-                st.warning("برای RTL بهتر، arabic-reshaper و python-bidi رو نصب کن.")
-                pass  # بدون reshape
         except Exception as e:
             st.warning(f"فونت فارسی خطا داد ({e}). به انگلیسی سوئیچ.")
             use_persian = False
@@ -332,6 +344,12 @@ def generate_pdf(title, elements, buffer, pagesize=A4):
     else:
         title_style = styles['Title']
         title = translations.get(title, title)  # ترجمه عنوان
+    
+    # 👈 Reshape all elements if RTL
+    if use_persian and RTL_AVAILABLE:
+        for elem in elements:
+            if isinstance(elem, Paragraph):
+                elem.text = get_display(arabic_reshaper.reshape(elem.text))
     
     elements.insert(0, Paragraph(title, title_style))
     doc.build(elements)
@@ -385,7 +403,7 @@ with tab1:
             height=chart_height
         )
         
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width='stretch')  # 👈 fix deprecation
         
         st.dataframe(
             mean_values.style
@@ -395,65 +413,70 @@ with tab1:
 
         # خروجی PDF برای Tab1 (بهبودیافته: ترجمه و reshape قبل از Table)
         if st.button("⬇️ دانلود PDF Tab1"):
-            buffer = io.BytesIO()
-            elements = []
-            
-            data = [mean_values.columns.tolist()] + mean_values.values.tolist()
-            
-            # ترجمه هدرها اگر انگلیسی
-            translations_local = {
-                "تجهیز": "Equipment",
-                "میانگین مصرف": "Avg Consumption",
-            }
-            use_persian = available_fonts and font_name != "Helvetica"
-            if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
-                data[0][0] = translations_local.get(data[0][0], data[0][0])
-                data[0][1] = translations_local.get(data[0][1], data[0][1])
-            
-            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-            if use_persian:
-                try:
-                    import arabic_reshaper
-                    from bidi.algorithm import get_display
+            if IS_CLOUD:
+                st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                html_buf = io.StringIO()
+                pio.write_html(fig_bar, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                html_content = html_buf.getvalue().encode('utf-8')
+                st.download_button("Download HTML", data=html_content, file_name="tab1_chart.html", mime="text/html")
+            else:
+                buffer = io.BytesIO()
+                elements = []
+                
+                data = [mean_values.columns.tolist()] + mean_values.values.tolist()
+                
+                # ترجمه هدرها اگر انگلیسی
+                translations_local = {
+                    "تجهیز": "Equipment",
+                    "میانگین مصرف": "Avg Consumption",
+                }
+                use_persian = available_fonts and font_name != "Helvetica"
+                if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
+                    data[0][0] = translations_local.get(data[0][0], data[0][0])
+                    data[0][1] = translations_local.get(data[0][1], data[0][1])
+                
+                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                if use_persian and RTL_AVAILABLE:
                     for row in data:
                         for i, cell in enumerate(row):
                             if isinstance(cell, str):
                                 row[i] = get_display(arabic_reshaper.reshape(cell))
-                except ImportError:
-                    st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-            
-            table = Table(data)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                ('ALIGN', (0,0), (-1,-1), 'CENTER')
-            ]))
-            elements.append(table)
-            
-            # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-            img_buf = io.BytesIO()
-            fig_bar.write_image(img_buf, format='png', width=800, height=chart_height, scale=2)
-            img_buf.seek(0)
-            elements.append(Image(img_buf, width=500, height=chart_height // 2))
-            
-            title = "میانگین مصرف تجهیزات"
-            if not use_persian:
-                title = translations.get(title, title)
-            generate_pdf(title, elements, buffer)
-            
-            # 👈 دانلود با getvalue() برای اطمینان
-            pdf_data = buffer.getvalue()
-            st.download_button(
-                label="دانلود PDF",
-                data=pdf_data,
-                file_name="tab1.pdf",
-                mime="application/pdf"
-            )
-            
-            # چک فونت
-            if not available_fonts:
-                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                
+                table = Table(data)
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                    ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                ]))
+                elements.append(table)
+                
+                # 👈 Conditional Image
+                img_buf = io.BytesIO()
+                try:
+                    fig_bar.write_image(img_buf, format='png', width=800, height=chart_height, scale=2)
+                    img_buf.seek(0)
+                    elements.append(Image(img_buf, width=500, height=chart_height // 2))
+                except Exception as e:
+                    st.warning(f"Export failed: {e}. Use HTML instead.")
+                
+                title = "میانگین مصرف تجهیزات"
+                if not use_persian:
+                    title = translations.get(title, title)
+                generate_pdf(title, elements, buffer)
+                
+                # 👈 دانلود با getvalue() برای اطمینان
+                pdf_data = buffer.getvalue()
+                st.download_button(
+                    label="دانلود PDF",
+                    data=pdf_data,
+                    file_name="tab1.pdf",
+                    mime="application/pdf"
+                )
+                
+                # چک فونت
+                if not available_fonts:
+                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab2: روند مصرف -----------
 with tab2:
@@ -483,36 +506,46 @@ with tab2:
             markers=True
         )
         fig_line.update_layout(xaxis_title="تاریخ شمسی", yaxis_title="مصرف (MWh)")
-        st.plotly_chart(fig_line, use_container_width=True)
+        st.plotly_chart(fig_line, width='stretch')  # 👈 fix deprecation
 
         # خروجی PDF برای Tab2
         if st.button("⬇️ دانلود PDF Tab2"):
-            buffer = io.BytesIO()
-            elements = []
-            
-            # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-            img_buf = io.BytesIO()
-            fig_line.write_image(img_buf, format='png', width=800, height=400, scale=2)
-            img_buf.seek(0)
-            elements.append(Image(img_buf, width=500, height=300))
-            
-            title = "روند مصرف تجهیزات"
-            if not use_persian:
-                title = translations.get(title, title)
-            generate_pdf(title, elements, buffer)
-            
-            # 👈 دانلود با getvalue() برای اطمینان
-            pdf_data = buffer.getvalue()
-            st.download_button(
-                label="دانلود PDF",
-                data=pdf_data,
-                file_name="tab2.pdf",
-                mime="application/pdf"
-            )
-            
-            # چک فونت
-            if not available_fonts:
-                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+            if IS_CLOUD:
+                st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                html_buf = io.StringIO()
+                pio.write_html(fig_line, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                html_content = html_buf.getvalue().encode('utf-8')
+                st.download_button("Download HTML", data=html_content, file_name="tab2_chart.html", mime="text/html")
+            else:
+                buffer = io.BytesIO()
+                elements = []
+                
+                # 👈 Conditional Image
+                img_buf = io.BytesIO()
+                try:
+                    fig_line.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                    img_buf.seek(0)
+                    elements.append(Image(img_buf, width=500, height=300))
+                except Exception as e:
+                    st.warning(f"Export failed: {e}. Use HTML instead.")
+                
+                title = "روند مصرف تجهیزات"
+                if not use_persian:
+                    title = translations.get(title, title)
+                generate_pdf(title, elements, buffer)
+                
+                # 👈 دانلود با getvalue() برای اطمینان
+                pdf_data = buffer.getvalue()
+                st.download_button(
+                    label="دانلود PDF",
+                    data=pdf_data,
+                    file_name="tab2.pdf",
+                    mime="application/pdf"
+                )
+                
+                # چک فونت
+                if not available_fonts:
+                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab3: ماهانه -----------
 with tab3:
@@ -563,69 +596,74 @@ with tab3:
             xaxis_tickangle=-45
         )
         
-        st.plotly_chart(fig_month, use_container_width=True)
+        st.plotly_chart(fig_month, width='stretch')  # 👈 fix deprecation
 
         # خروجی PDF برای Tab3 (بهبودیافته)
         if st.button("⬇️ دانلود PDF Tab3"):
-            buffer = io.BytesIO()
-            elements = []
-            
-            data = [monthly_df.columns.tolist()] + monthly_df.values.tolist()
-            
-            # ترجمه هدرها اگر انگلیسی
-            translations_local = {
-                "ماه شمسی": "Jalali Month",
-                monthly_column: "Consumption"
-            }
-            use_persian = available_fonts and font_name != "Helvetica"
-            if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
-                data[0][0] = translations_local.get(data[0][0], data[0][0])
-                data[0][1] = translations_local.get(data[0][1], data[0][1])
-            
-            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-            if use_persian:
-                try:
-                    import arabic_reshaper
-                    from bidi.algorithm import get_display
+            if IS_CLOUD:
+                st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                html_buf = io.StringIO()
+                pio.write_html(fig_month, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                html_content = html_buf.getvalue().encode('utf-8')
+                st.download_button("Download HTML", data=html_content, file_name="tab3_chart.html", mime="text/html")
+            else:
+                buffer = io.BytesIO()
+                elements = []
+                
+                data = [monthly_df.columns.tolist()] + monthly_df.values.tolist()
+                
+                # ترجمه هدرها اگر انگلیسی
+                translations_local = {
+                    "ماه شمسی": "Jalali Month",
+                    monthly_column: "Consumption"
+                }
+                use_persian = available_fonts and font_name != "Helvetica"
+                if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
+                    data[0][0] = translations_local.get(data[0][0], data[0][0])
+                    data[0][1] = translations_local.get(data[0][1], data[0][1])
+                
+                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                if use_persian and RTL_AVAILABLE:
                     for row in data:
                         for i, cell in enumerate(row):
                             if isinstance(cell, str):
                                 row[i] = get_display(arabic_reshaper.reshape(cell))
-                except ImportError:
-                    st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-            
-            table = Table(data)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                ('ALIGN', (0,0), (-1,-1), 'CENTER')
-            ]))
-            elements.append(table)
-            
-            # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-            img_buf = io.BytesIO()
-            fig_month.write_image(img_buf, format='png', width=800, height=400, scale=2)
-            img_buf.seek(0)
-            elements.append(Image(img_buf, width=500, height=300))
-            
-            title = "نمودار مصرف ماهیانه"
-            if not use_persian:
-                title = translations.get(title, title)
-            generate_pdf(title, elements, buffer)
-            
-            # 👈 دانلود با getvalue() برای اطمینان
-            pdf_data = buffer.getvalue()
-            st.download_button(
-                label="دانلود PDF",
-                data=pdf_data,
-                file_name="tab3.pdf",
-                mime="application/pdf"
-            )
-            
-            # چک فونت
-            if not available_fonts:
-                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                
+                table = Table(data)
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                    ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                ]))
+                elements.append(table)
+                
+                # 👈 Conditional Image
+                img_buf = io.BytesIO()
+                try:
+                    fig_month.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                    img_buf.seek(0)
+                    elements.append(Image(img_buf, width=500, height=300))
+                except Exception as e:
+                    st.warning(f"Export failed: {e}. Use HTML instead.")
+                
+                title = "نمودار مصرف ماهیانه"
+                if not use_persian:
+                    title = translations.get(title, title)
+                generate_pdf(title, elements, buffer)
+                
+                # 👈 دانلود با getvalue() برای اطمینان
+                pdf_data = buffer.getvalue()
+                st.download_button(
+                    label="دانلود PDF",
+                    data=pdf_data,
+                    file_name="tab3.pdf",
+                    mime="application/pdf"
+                )
+                
+                # چک فونت
+                if not available_fonts:
+                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab4: Heatmap -----------
 # ----------- Tab4: Heatmap -----------
@@ -693,7 +731,7 @@ with tab4:
                         margin=dict(l=50, r=50, t=50, b=50),  # حاشیه برای جداسازی
                         # برای بوردر سلول‌ها، می‌توان از annotations یا shapes استفاده کرد، اما xgap کافی است
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')  # 👈 fix deprecation
 
             elif view_mode == "ماهانه ماتریسی":
                 months = sorted(df_hm["ماه"].unique())
@@ -732,7 +770,7 @@ with tab4:
                     paper_bgcolor='lightgray',
                     margin=dict(l=50, r=50, t=50, b=50),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')  # 👈 fix deprecation
 
             # 👈 چک کردن fig قبل از PDF
             if fig is not None:
@@ -743,67 +781,72 @@ with tab4:
 
                 # خروجی PDF برای Tab4
                 if st.button("⬇️ دانلود PDF Tab4"):
-                    buffer = io.BytesIO()
-                    elements = []
-                    
-                    # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                    img_buf = io.BytesIO()
-                    fig.write_image(img_buf, format='png', width=800, height=fig.layout.height, scale=2)
-                    img_buf.seek(0)
-                    elements.append(Image(img_buf, width=500, height=fig.layout.height // 2))
-                    
-                    data = [monthly_summary.columns.tolist()] + monthly_summary.values.tolist()
-                    
-                    # ترجمه هدرها اگر انگلیسی
-                    translations_local = {
-                        "ماه": "Month",
-                        "مجموع": "Total",
-                        "میانگین": "Average"
-                    }
-                    use_persian = available_fonts and font_name != "Helvetica"
-                    if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
-                        data[0][0] = translations_local.get(data[0][0], data[0][0])
-                        data[0][1] = translations_local.get(data[0][1], data[0][1])
-                        data[0][2] = translations_local.get(data[0][2], data[0][2])
-                    
-                    # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                    if use_persian:
+                    if IS_CLOUD:
+                        st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                        html_buf = io.StringIO()
+                        pio.write_html(fig, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                        html_content = html_buf.getvalue().encode('utf-8')
+                        st.download_button("Download HTML", data=html_content, file_name="tab4_chart.html", mime="text/html")
+                    else:
+                        buffer = io.BytesIO()
+                        elements = []
+                        
+                        # 👈 Conditional Image
+                        img_buf = io.BytesIO()
                         try:
-                            import arabic_reshaper
-                            from bidi.algorithm import get_display
+                            fig.write_image(img_buf, format='png', width=800, height=fig.layout.height, scale=2)
+                            img_buf.seek(0)
+                            elements.append(Image(img_buf, width=500, height=fig.layout.height // 2))
+                        except Exception as e:
+                            st.warning(f"Export failed: {e}. Use HTML instead.")
+                        
+                        data = [monthly_summary.columns.tolist()] + monthly_summary.values.tolist()
+                        
+                        # ترجمه هدرها اگر انگلیسی
+                        translations_local = {
+                            "ماه": "Month",
+                            "مجموع": "Total",
+                            "میانگین": "Average"
+                        }
+                        use_persian = available_fonts and font_name != "Helvetica"
+                        if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 3:
+                            data[0][0] = translations_local.get(data[0][0], data[0][0])
+                            data[0][1] = translations_local.get(data[0][1], data[0][1])
+                            data[0][2] = translations_local.get(data[0][2], data[0][2])
+                        
+                        # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                        if use_persian and RTL_AVAILABLE:
                             for row in data:
                                 for i, cell in enumerate(row):
                                     if isinstance(cell, str):
                                         row[i] = get_display(arabic_reshaper.reshape(cell))
-                        except ImportError:
-                            st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-                    
-                    table = Table(data)
-                    table.setStyle(TableStyle([
-                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                        ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                        ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                    ]))
-                    elements.append(table)
-                    
-                    title = "Heatmap مصرف تجهیزات"
-                    if not use_persian:
-                        title = translations.get(title, title)
-                    generate_pdf(title, elements, buffer)
-                    
-                    # 👈 دانلود با getvalue() برای اطمینان
-                    pdf_data = buffer.getvalue()
-                    st.download_button(
-                        label="دانلود PDF",
-                        data=pdf_data,
-                        file_name="tab4.pdf",
-                        mime="application/pdf"
-                    )
-                    
-                    # چک فونت
-                    if not available_fonts:
-                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                        
+                        table = Table(data)
+                        table.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                            ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                            ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                        ]))
+                        elements.append(table)
+                        
+                        title = "Heatmap مصرف تجهیزات"
+                        if not use_persian:
+                            title = translations.get(title, title)
+                        generate_pdf(title, elements, buffer)
+                        
+                        # 👈 دانلود با getvalue() برای اطمینان
+                        pdf_data = buffer.getvalue()
+                        st.download_button(
+                            label="دانلود PDF",
+                            data=pdf_data,
+                            file_name="tab4.pdf",
+                            mime="application/pdf"
+                        )
+                        
+                        # چک فونت
+                        if not available_fonts:
+                            st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
             else:
                 st.warning("⚠️ نمودار Heatmap تولید نشد؛ داده‌ها را بررسی کنید.")
         else:
@@ -817,76 +860,76 @@ with tab5:
     if uploaded_file_tab5:
         df_tab5 = pd.read_excel(uploaded_file_tab5, sheet_name=0)
 
-        buffer = io.BytesIO()
-        elements = []
-
-        styles = getSampleStyleSheet()
-        use_persian = available_fonts and font_name != "Helvetica"
-        if use_persian:
-            try:
-                pdfmetrics.registerFont(TTFont(font_name, fonts[font_name]))
-                title_style = ParagraphStyle('Title', fontName=font_name, fontSize=18, alignment=1)
-                normal_style = ParagraphStyle('Normal', fontName=font_name, fontSize=12, alignment=1)
-            except Exception as e:
-                st.warning(f"فونت فارسی خطا داد ({e}). به انگلیسی سوئیچ.")
-                use_persian = False
+        if IS_CLOUD:
+            st.warning("PDF/Image export limited in cloud. Download data as CSV instead.")
+            csv = df_tab5.to_csv(index=False).encode('utf-8')
+            st.download_button("Download CSV", data=csv, file_name="data.csv", mime="text/csv")
         else:
-            title_style = styles['Title']
-            normal_style = styles['Normal']
-        
-        title = Paragraph("گزارش تجهیزات", title_style)
-        elements.append(title)
-        elements.append(Spacer(1, 12))
+            buffer = io.BytesIO()
+            elements = []
 
-        data = [df_tab5.columns.tolist()] + df_tab5.values.tolist()
+            styles = getSampleStyleSheet()
+            use_persian = available_fonts and font_name != "Helvetica"
+            if use_persian:
+                try:
+                    pdfmetrics.registerFont(TTFont(font_name, fonts[font_name]))
+                    title_style = ParagraphStyle('Title', fontName=font_name, fontSize=18, alignment=1)
+                    normal_style = ParagraphStyle('Normal', fontName=font_name, fontSize=12, alignment=1)
+                except Exception as e:
+                    st.warning(f"فونت فارسی خطا داد ({e}). به انگلیسی سوئیچ.")
+                    use_persian = False
+            else:
+                title_style = styles['Title']
+                normal_style = styles['Normal']
+            
+            title = Paragraph("گزارش تجهیزات", title_style)
+            elements.append(title)
+            elements.append(Spacer(1, 12))
 
-        # ترجمه هدرها اگر انگلیسی
-        translations_local = {
-            "تجهیز": "Equipment",
-            # Add more as needed
-        }
-        if not use_persian and data and isinstance(data[0], list):
-            for i, header in enumerate(data[0]):
-                data[0][i] = translations_local.get(header, header)
-        
-        # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-        if use_persian:
-            try:
-                import arabic_reshaper
-                from bidi.algorithm import get_display
+            data = [df_tab5.columns.tolist()] + df_tab5.values.tolist()
+
+            # ترجمه هدرها اگر انگلیسی
+            translations_local = {
+                "تجهیز": "Equipment",
+                # Add more as needed
+            }
+            if not use_persian and data and isinstance(data[0], list):
+                for i, header in enumerate(data[0]):
+                    data[0][i] = translations_local.get(header, header)
+            
+            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+            if use_persian and RTL_AVAILABLE:
                 for row in data:
                     for i, cell in enumerate(row):
                         if isinstance(cell, str):
                             row[i] = get_display(arabic_reshaper.reshape(cell))
-            except ImportError:
-                st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
 
-        table = Table(data)
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.black),
-            ('GRID', (0,0), (-1,-1), 1, colors.black),
-            ('ALIGN', (0,0), (-1,-1), 'CENTER')
-        ]))
-        elements.append(table)
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.black),
+                ('GRID', (0,0), (-1,-1), 1, colors.black),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER')
+            ]))
+            elements.append(table)
 
-        title_str = "گزارش تجهیزات"
-        if not use_persian:
-            title_str = translations.get(title_str, title_str)
-        generate_pdf(title_str, elements, buffer)
+            title_str = "گزارش تجهیزات"
+            if not use_persian:
+                title_str = translations.get(title_str, title_str)
+            generate_pdf(title_str, elements, buffer)
 
-        # 👈 دانلود با getvalue() برای اطمینان
-        pdf_data = buffer.getvalue()
-        st.download_button(
-            label="⬇️ دانلود PDF",
-            data=pdf_data,
-            file_name="گزارش_تجهیزات.pdf",
-            mime="application/pdf"
-        )
-        
-        # چک فونت
-        if not available_fonts:
-            st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+            # 👈 دانلود با getvalue() برای اطمینان
+            pdf_data = buffer.getvalue()
+            st.download_button(
+                label="⬇️ دانلود PDF",
+                data=pdf_data,
+                file_name="گزارش_تجهیزات.pdf",
+                mime="application/pdf"
+            )
+            
+            # چک فونت
+            if not available_fonts:
+                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab6: پیش‌بینی -----------
 with tab6:
@@ -938,69 +981,74 @@ with tab6:
                 yaxis_title="مصرف (MWh)",
                 xaxis_tickangle=-45
             )
-            st.plotly_chart(fig_forecast, use_container_width=True)
+            st.plotly_chart(fig_forecast, width='stretch')  # 👈 fix deprecation
 
             # خروجی PDF برای Tab6
             if st.button("⬇️ دانلود PDF Tab6"):
-                buffer = io.BytesIO()
-                elements = []
-                
-                data = [df_pred.columns.tolist()] + df_pred.values.tolist()
-                
-                # ترجمه هدرها اگر انگلیسی
-                translations_local = {
-                    "تاریخ نمایش": "Display Date",
-                    forecast_col: "Consumption"
-                }
-                use_persian = available_fonts and font_name != "Helvetica"
-                if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
-                    data[0][0] = translations_local.get(data[0][0], data[0][0])
-                    data[0][1] = translations_local.get(data[0][1], data[0][1])
-                
-                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                if use_persian:
-                    try:
-                        import arabic_reshaper
-                        from bidi.algorithm import get_display
+                if IS_CLOUD:
+                    st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                    html_buf = io.StringIO()
+                    pio.write_html(fig_forecast, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                    html_content = html_buf.getvalue().encode('utf-8')
+                    st.download_button("Download HTML", data=html_content, file_name="tab6_chart.html", mime="text/html")
+                else:
+                    buffer = io.BytesIO()
+                    elements = []
+                    
+                    data = [df_pred.columns.tolist()] + df_pred.values.tolist()
+                    
+                    # ترجمه هدرها اگر انگلیسی
+                    translations_local = {
+                        "تاریخ نمایش": "Display Date",
+                        forecast_col: "Consumption"
+                    }
+                    use_persian = available_fonts and font_name != "Helvetica"
+                    if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
+                        data[0][0] = translations_local.get(data[0][0], data[0][0])
+                        data[0][1] = translations_local.get(data[0][1], data[0][1])
+                    
+                    # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                    if use_persian and RTL_AVAILABLE:
                         for row in data:
                             for i, cell in enumerate(row):
                                 if isinstance(cell, str):
                                     row[i] = get_display(arabic_reshaper.reshape(cell))
-                    except ImportError:
-                        st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-                
-                table = Table(data)
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                    ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                    ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                    ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                ]))
-                elements.append(table)
-                
-                # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                img_buf = io.BytesIO()
-                fig_forecast.write_image(img_buf, format='png', width=800, height=400, scale=2)
-                img_buf.seek(0)
-                elements.append(Image(img_buf, width=500, height=300))
-                
-                title = "پیش‌بینی مصرف تجهیزات"
-                if not use_persian:
-                    title = translations.get(title, title)
-                generate_pdf(title, elements, buffer)
-                
-                # 👈 دانلود با getvalue() برای اطمینان
-                pdf_data = buffer.getvalue()
-                st.download_button(
-                    label="دانلود PDF",
-                    data=pdf_data,
-                    file_name="tab6.pdf",
-                    mime="application/pdf"
-                )
-                
-                # چک فونت
-                if not available_fonts:
-                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                    
+                    table = Table(data)
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                        ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                        ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                    ]))
+                    elements.append(table)
+                    
+                    # 👈 Conditional Image
+                    img_buf = io.BytesIO()
+                    try:
+                        fig_forecast.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                        img_buf.seek(0)
+                        elements.append(Image(img_buf, width=500, height=300))
+                    except Exception as e:
+                        st.warning(f"Export failed: {e}. Use HTML instead.")
+                    
+                    title = "پیش‌بینی مصرف تجهیزات"
+                    if not use_persian:
+                        title = translations.get(title, title)
+                    generate_pdf(title, elements, buffer)
+                    
+                    # 👈 دانلود با getvalue() برای اطمینان
+                    pdf_data = buffer.getvalue()
+                    st.download_button(
+                        label="دانلود PDF",
+                        data=pdf_data,
+                        file_name="tab6.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # چک فونت
+                    if not available_fonts:
+                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab7: KPI پیشرفته -----------
 with tab7:
@@ -1057,75 +1105,80 @@ with tab7:
             yaxis_title="مصرف متوسط (MWh)",
             legend_title="تجهیزات"
         )
-        st.plotly_chart(fig_avg, use_container_width=True)
+        st.plotly_chart(fig_avg, width='stretch')  # 👈 fix deprecation
 
         # خروجی PDF برای Tab7
         if st.button("⬇️ دانلود PDF Tab7"):
-            buffer = io.BytesIO()
-            elements = []
-            
-            kpi_data = [['تجهیز', 'مجموع', 'میانگین', 'بیشترین']]
-            for col_name, total, avg, max_val in kpis:
-                kpi_data.append([col_name, f"{total:,.0f}", f"{avg:,.2f}", f"{max_val:,.0f}"])
-            
-            # ترجمه هدرها اگر انگلیسی
-            translations_local = {
-                "تجهیز": "Equipment",
-                "مجموع": "Total",
-                "میانگین": "Average",
-                "بیشترین": "Max"
-            }
-            use_persian = available_fonts and font_name != "Helvetica"
-            if not use_persian and kpi_data and isinstance(kpi_data[0], list) and len(kpi_data[0]) >= 4:
-                kpi_data[0][0] = translations_local.get(kpi_data[0][0], kpi_data[0][0])
-                kpi_data[0][1] = translations_local.get(kpi_data[0][1], kpi_data[0][1])
-                kpi_data[0][2] = translations_local.get(kpi_data[0][2], kpi_data[0][2])
-                kpi_data[0][3] = translations_local.get(kpi_data[0][3], kpi_data[0][3])
-            
-            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-            if use_persian:
-                try:
-                    import arabic_reshaper
-                    from bidi.algorithm import get_display
+            if IS_CLOUD:
+                st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                html_buf = io.StringIO()
+                pio.write_html(fig_avg, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                html_content = html_buf.getvalue().encode('utf-8')
+                st.download_button("Download HTML", data=html_content, file_name="tab7_chart.html", mime="text/html")
+            else:
+                buffer = io.BytesIO()
+                elements = []
+                
+                kpi_data = [['تجهیز', 'مجموع', 'میانگین', 'بیشترین']]
+                for col_name, total, avg, max_val in kpis:
+                    kpi_data.append([col_name, f"{total:,.0f}", f"{avg:,.2f}", f"{max_val:,.0f}"])
+                
+                # ترجمه هدرها اگر انگلیسی
+                translations_local = {
+                    "تجهیز": "Equipment",
+                    "مجموع": "Total",
+                    "میانگین": "Average",
+                    "بیشترین": "Max"
+                }
+                use_persian = available_fonts and font_name != "Helvetica"
+                if not use_persian and kpi_data and isinstance(kpi_data[0], list) and len(kpi_data[0]) >= 4:
+                    kpi_data[0][0] = translations_local.get(kpi_data[0][0], kpi_data[0][0])
+                    kpi_data[0][1] = translations_local.get(kpi_data[0][1], kpi_data[0][1])
+                    kpi_data[0][2] = translations_local.get(kpi_data[0][2], kpi_data[0][2])
+                    kpi_data[0][3] = translations_local.get(kpi_data[0][3], kpi_data[0][3])
+                
+                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                if use_persian and RTL_AVAILABLE:
                     for row in kpi_data:
                         for i, cell in enumerate(row):
                             if isinstance(cell, str):
                                 row[i] = get_display(arabic_reshaper.reshape(cell))
-                except ImportError:
-                    st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-            
-            table = Table(kpi_data)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                ('ALIGN', (0,0), (-1,-1), 'CENTER')
-            ]))
-            elements.append(table)
-            
-            # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-            img_buf = io.BytesIO()
-            fig_avg.write_image(img_buf, format='png', width=800, height=400, scale=2)
-            img_buf.seek(0)
-            elements.append(Image(img_buf, width=500, height=300))
-            
-            title = "KPI پیشرفته"
-            if not use_persian:
-                title = translations.get(title, title)
-            generate_pdf(title, elements, buffer)
-            
-            # 👈 دانلود با getvalue() برای اطمینان
-            pdf_data = buffer.getvalue()
-            st.download_button(
-                label="دانلود PDF",
-                data=pdf_data,
-                file_name="tab7.pdf",
-                mime="application/pdf"
-            )
-            
-            # چک فونت
-            if not available_fonts:
-                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                
+                table = Table(kpi_data)
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                    ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                    ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                    ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                ]))
+                elements.append(table)
+                
+                # 👈 Conditional Image
+                img_buf = io.BytesIO()
+                try:
+                    fig_avg.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                    img_buf.seek(0)
+                    elements.append(Image(img_buf, width=500, height=300))
+                except Exception as e:
+                    st.warning(f"Export failed: {e}. Use HTML instead.")
+                
+                title = "KPI پیشرفته"
+                if not use_persian:
+                    title = translations.get(title, title)
+                generate_pdf(title, elements, buffer)
+                
+                # 👈 دانلود با getvalue() برای اطمینان
+                pdf_data = buffer.getvalue()
+                st.download_button(
+                    label="دانلود PDF",
+                    data=pdf_data,
+                    file_name="tab7.pdf",
+                    mime="application/pdf"
+                )
+                
+                # چک فونت
+                if not available_fonts:
+                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
     else:
         st.warning("⚠️ هیچ تجهیزی برای KPI انتخاب نشده است.")
 
@@ -1175,7 +1228,7 @@ with tab8:
                 template="plotly_white"
             )
             fig_line.update_layout(yaxis_title="درصد تغییر (%)", xaxis_title="تاریخ")
-            st.plotly_chart(fig_line, use_container_width=True)
+            st.plotly_chart(fig_line, width='stretch')  # 👈 fix deprecation
 
             measures = ["relative"] * len(df_change)
             measures[-1] = "total"
@@ -1201,7 +1254,7 @@ with tab8:
                 yaxis_title="درصد تغییر (%)",
                 xaxis_title="تاریخ"
             )
-            st.plotly_chart(fig_wf, use_container_width=True)
+            st.plotly_chart(fig_wf, width='stretch')  # 👈 fix deprecation
 
             idx_max = df_change["درصد تغییر"].idxmax()
             idx_min = df_change["درصد تغییر"].idxmin()
@@ -1217,72 +1270,84 @@ with tab8:
 
             # خروجی PDF برای Tab8
             if st.button("⬇️ دانلود PDF Tab8"):
-                buffer = io.BytesIO()
-                elements = []
-                
-                data = [df_change[["تاریخ نمایش", selected_col, "درصد تغییر"]].columns.tolist()] + df_change[["تاریخ نمایش", selected_col, "درصد تغییر"]].round(2).values.tolist()
-                
-                # ترجمه هدرها اگر انگلیسی
-                translations_local = {
-                    "تاریخ نمایش": "Display Date",
-                    selected_col: "Consumption",
-                    "درصد تغییر": "Percent Change"
-                }
-                use_persian = available_fonts and font_name != "Helvetica"
-                if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 3:
-                    data[0][0] = translations_local.get(data[0][0], data[0][0])
-                    data[0][1] = translations_local.get(data[0][1], data[0][1])
-                    data[0][2] = translations_local.get(data[0][2], data[0][2])
-                
-                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                if use_persian:
-                    try:
-                        import arabic_reshaper
-                        from bidi.algorithm import get_display
+                if IS_CLOUD:
+                    st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                    html_buf = io.StringIO()
+                    pio.write_html(fig_line, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                    html_content = html_buf.getvalue().encode('utf-8')
+                    st.download_button("Download HTML Line", data=html_content, file_name="tab8_line.html", mime="text/html")
+                    html_buf_wf = io.StringIO()
+                    pio.write_html(fig_wf, file=html_buf_wf, include_plotlyjs='cdn', full_html=False)
+                    html_content_wf = html_buf_wf.getvalue().encode('utf-8')
+                    st.download_button("Download HTML Waterfall", data=html_content_wf, file_name="tab8_waterfall.html", mime="text/html")
+                else:
+                    buffer = io.BytesIO()
+                    elements = []
+                    
+                    data = [df_change[["تاریخ نمایش", selected_col, "درصد تغییر"]].columns.tolist()] + df_change[["تاریخ نمایش", selected_col, "درصد تغییر"]].round(2).values.tolist()
+                    
+                    # ترجمه هدرها اگر انگلیسی
+                    translations_local = {
+                        "تاریخ نمایش": "Display Date",
+                        selected_col: "Consumption",
+                        "درصد تغییر": "Percent Change"
+                    }
+                    use_persian = available_fonts and font_name != "Helvetica"
+                    if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 3:
+                        data[0][0] = translations_local.get(data[0][0], data[0][0])
+                        data[0][1] = translations_local.get(data[0][1], data[0][1])
+                        data[0][2] = translations_local.get(data[0][2], data[0][2])
+                    
+                    # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                    if use_persian and RTL_AVAILABLE:
                         for row in data:
                             for i, cell in enumerate(row):
                                 if isinstance(cell, str):
                                     row[i] = get_display(arabic_reshaper.reshape(cell))
-                    except ImportError:
-                        st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-                
-                table = Table(data)
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                    ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                    ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                    ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                ]))
-                elements.append(table)
-                
-                # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                img_buf1 = io.BytesIO()
-                fig_line.write_image(img_buf1, format='png', width=800, height=400, scale=2)
-                img_buf1.seek(0)
-                elements.append(Image(img_buf1, width=500, height=300))
-                
-                img_buf2 = io.BytesIO()
-                fig_wf.write_image(img_buf2, format='png', width=800, height=400, scale=2)
-                img_buf2.seek(0)
-                elements.append(Image(img_buf2, width=500, height=300))
-                
-                title = "تحلیل روند تغییرات"
-                if not use_persian:
-                    title = translations.get(title, title)
-                generate_pdf(title, elements, buffer)
-                
-                # 👈 دانلود با getvalue() برای اطمینان
-                pdf_data = buffer.getvalue()
-                st.download_button(
-                    label="دانلود PDF",
-                    data=pdf_data,
-                    file_name="tab8.pdf",
-                    mime="application/pdf"
-                )
-                
-                # چک فونت
-                if not available_fonts:
-                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                    
+                    table = Table(data)
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                        ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                        ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                    ]))
+                    elements.append(table)
+                    
+                    # 👈 Conditional Images
+                    img_buf1 = io.BytesIO()
+                    try:
+                        fig_line.write_image(img_buf1, format='png', width=800, height=400, scale=2)
+                        img_buf1.seek(0)
+                        elements.append(Image(img_buf1, width=500, height=300))
+                    except Exception as e:
+                        st.warning(f"Line export failed: {e}. Use HTML instead.")
+                    
+                    img_buf2 = io.BytesIO()
+                    try:
+                        fig_wf.write_image(img_buf2, format='png', width=800, height=400, scale=2)
+                        img_buf2.seek(0)
+                        elements.append(Image(img_buf2, width=500, height=300))
+                    except Exception as e:
+                        st.warning(f"Waterfall export failed: {e}. Use HTML instead.")
+                    
+                    title = "تحلیل روند تغییرات"
+                    if not use_persian:
+                        title = translations.get(title, title)
+                    generate_pdf(title, elements, buffer)
+                    
+                    # 👈 دانلود با getvalue() برای اطمینان
+                    pdf_data = buffer.getvalue()
+                    st.download_button(
+                        label="دانلود PDF",
+                        data=pdf_data,
+                        file_name="tab8.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # چک فونت
+                    if not available_fonts:
+                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
         else:
             st.warning("📭 داده کافی برای رسم نمودار وجود ندارد.")
 
@@ -1325,9 +1390,10 @@ with tab9:
             df_pred_future_arima = pd.DataFrame(columns=['ds', 'Predicted', 'Lower', 'Upper'])
             df_pred_future_exp = pd.DataFrame(columns=['ds', 'Predicted', 'Lower', 'Upper'])
 
+            # 👈 Broader try-except for Prophet
+            mae_prophet = rmse_prophet = float('nan')
             try:
-                from prophet import Prophet
-                m = Prophet(daily_seasonality=True)
+                m = Prophet(daily_seasonality=True, yearly_seasonality=True)  # 👈 add yearly
                 m.fit(train_df)
 
                 future_test = test_df[['ds']].copy()
@@ -1341,11 +1407,11 @@ with tab9:
                 mae_prophet = valid_p['y'].sub(valid_p['Predicted']).abs().mean() if len(valid_p) > 0 else float('nan')
                 rmse_prophet = ((valid_p['y'] - valid_p['Predicted'])**2).mean()**0.5 if len(valid_p) > 0 else float('nan')
             except Exception as e:
-                mae_prophet = rmse_prophet = float('nan')
                 st.error(f"⚠️ خطا در اجرای Prophet برای {col}: {e}")
 
+            # 👈 Similar for ARIMA
+            mae_arima = rmse_arima = float('nan')
             try:
-                from statsmodels.tsa.arima.model import ARIMA
                 ts_arima_train = train_df.set_index('ds')['y']
                 arima_model = ARIMA(ts_arima_train, order=(1,1,1))
                 arima_fit = arima_model.fit()
@@ -1367,11 +1433,11 @@ with tab9:
                 else:
                     mae_arima = rmse_arima = float('nan')
             except Exception as e:
-                mae_arima = rmse_arima = float('nan')
                 st.error(f"⚠️ خطا در اجرای ARIMA برای {col}: {e}")
 
+            # 👈 Similar for Exp
+            mae_exp = rmse_exp = float('nan')
             try:
-                from statsmodels.tsa.holtwinters import ExponentialSmoothing
                 ts_exp_train = train_df.set_index('ds')['y']
                 exp_model = ExponentialSmoothing(ts_exp_train, trend='add', seasonal=None, damped_trend=True)
                 exp_fit = exp_model.fit()
@@ -1393,7 +1459,6 @@ with tab9:
                 else:
                     mae_exp = rmse_exp = float('nan')
             except Exception as e:
-                mae_exp = rmse_exp = float('nan')
                 st.error(f"⚠️ خطا در اجرای Exponential Smoothing برای {col}: {e}")
 
             error_table.append([col, 'Prophet', round(mae_prophet, 2) if not pd.isna(mae_prophet) else None,
@@ -1418,8 +1483,9 @@ with tab9:
                 best_model = None
                 best_rmse = None
 
+            # 👈 Full models similar, with try-except
             try:
-                m_full = Prophet(daily_seasonality=True)
+                m_full = Prophet(daily_seasonality=True, yearly_seasonality=True)
                 m_full.fit(ts)
                 future_full = m_full.make_future_dataframe(periods=30)
                 forecast_full = m_full.predict(future_full)
@@ -1514,7 +1580,7 @@ with tab9:
                 yaxis_title="مقدار مصرف",
                 template="plotly_white"
             )
-            st.plotly_chart(fig, use_container_width=True, key=f"ml_chart_{col}")
+            st.plotly_chart(fig, width='stretch', key=f"ml_chart_{col}")  # 👈 fix deprecation
 
             if best_model is not None:
                 st.success(f"💡 بهترین مدل برای {col}: {best_model} (RMSE = {best_rmse:.2f})")
@@ -1523,32 +1589,42 @@ with tab9:
 
             # خروجی PDF برای Tab9 (برای هر تجهیز)
             if st.button(f"⬇️ دانلود PDF برای {col}"):
-                buffer = io.BytesIO()
-                elements = []
-                
-                # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                img_buf = io.BytesIO()
-                fig.write_image(img_buf, format='png', width=800, height=400, scale=2)
-                img_buf.seek(0)
-                elements.append(Image(img_buf, width=500, height=300))
-                
-                title = f"پیش‌بینی {col}"
-                if not use_persian:
-                    title = translations.get("پیش‌بینی", "Forecast") + f" {col}"
-                generate_pdf(title, elements, buffer)
-                
-                # 👈 دانلود با getvalue() برای اطمینان
-                pdf_data = buffer.getvalue()
-                st.download_button(
-                    label="دانلود PDF",
-                    data=pdf_data,
-                    file_name=f"tab9_{col}.pdf",
-                    mime="application/pdf"
-                )
-                
-                # چک فونت
-                if not available_fonts:
-                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                if IS_CLOUD:
+                    st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                    html_buf = io.StringIO()
+                    pio.write_html(fig, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                    html_content = html_buf.getvalue().encode('utf-8')
+                    st.download_button("Download HTML", data=html_content, file_name=f"tab9_{col}_chart.html", mime="text/html")
+                else:
+                    buffer = io.BytesIO()
+                    elements = []
+                    
+                    # 👈 Conditional Image
+                    img_buf = io.BytesIO()
+                    try:
+                        fig.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                        img_buf.seek(0)
+                        elements.append(Image(img_buf, width=500, height=300))
+                    except Exception as e:
+                        st.warning(f"Export failed: {e}. Use HTML instead.")
+                    
+                    title = f"پیش‌بینی {col}"
+                    if not use_persian:
+                        title = translations.get("پیش‌بینی", "Forecast") + f" {col}"
+                    generate_pdf(title, elements, buffer)
+                    
+                    # 👈 دانلود با getvalue() برای اطمینان
+                    pdf_data = buffer.getvalue()
+                    st.download_button(
+                        label="دانلود PDF",
+                        data=pdf_data,
+                        file_name=f"tab9_{col}.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # چک فونت
+                    if not available_fonts:
+                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
         if error_table:
             st.markdown("### 📊 جدول خطاها برای همه تجهیزات")
@@ -1557,63 +1633,63 @@ with tab9:
 
             # خروجی PDF برای جدول خطاها
             if st.button("⬇️ دانلود PDF جدول خطاها Tab9"):
-                buffer = io.BytesIO()
-                elements = []
-                
-                data = [error_df.columns.tolist()] + error_df.values.tolist()
-                
-                # ترجمه هدرها اگر انگلیسی
-                translations_local = {
-                    "تجهیز": "Equipment",
-                    "مدل": "Model",
-                    "MAE": "MAE",
-                    "RMSE": "RMSE"
-                }
-                use_persian = available_fonts and font_name != "Helvetica"
-                if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 4:
-                    data[0][0] = translations_local.get(data[0][0], data[0][0])
-                    data[0][1] = translations_local.get(data[0][1], data[0][1])
-                    data[0][2] = translations_local.get(data[0][2], data[0][2])
-                    data[0][3] = translations_local.get(data[0][3], data[0][3])
-                
-                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                if use_persian:
-                    try:
-                        import arabic_reshaper
-                        from bidi.algorithm import get_display
+                if IS_CLOUD:
+                    st.warning("PDF export limited in cloud. Download CSV instead.")
+                    csv = error_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download CSV", data=csv, file_name="errors.csv", mime="text/csv")
+                else:
+                    buffer = io.BytesIO()
+                    elements = []
+                    
+                    data = [error_df.columns.tolist()] + error_df.values.tolist()
+                    
+                    # ترجمه هدرها اگر انگلیسی
+                    translations_local = {
+                        "تجهیز": "Equipment",
+                        "مدل": "Model",
+                        "MAE": "MAE",
+                        "RMSE": "RMSE"
+                    }
+                    use_persian = available_fonts and font_name != "Helvetica"
+                    if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 4:
+                        data[0][0] = translations_local.get(data[0][0], data[0][0])
+                        data[0][1] = translations_local.get(data[0][1], data[0][1])
+                        data[0][2] = translations_local.get(data[0][2], data[0][2])
+                        data[0][3] = translations_local.get(data[0][3], data[0][3])
+                    
+                    # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                    if use_persian and RTL_AVAILABLE:
                         for row in data:
                             for i, cell in enumerate(row):
                                 if isinstance(cell, str):
                                     row[i] = get_display(arabic_reshaper.reshape(cell))
-                    except ImportError:
-                        st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-                
-                table = Table(data)
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                    ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                    ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                    ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                ]))
-                elements.append(table)
-                
-                title = "جدول خطاها"
-                if not use_persian:
-                    title = translations.get(title, title)
-                generate_pdf(title, elements, buffer)
-                
-                # 👈 دانلود با getvalue() برای اطمینان
-                pdf_data = buffer.getvalue()
-                st.download_button(
-                    label="دانلود PDF",
-                    data=pdf_data,
-                    file_name="tab9_errors.pdf",
-                    mime="application/pdf"
-                )
-                
-                # چک فونت
-                if not available_fonts:
-                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                    
+                    table = Table(data)
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                        ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                        ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                    ]))
+                    elements.append(table)
+                    
+                    title = "جدول خطاها"
+                    if not use_persian:
+                        title = translations.get(title, title)
+                    generate_pdf(title, elements, buffer)
+                    
+                    # 👈 دانلود با getvalue() برای اطمینان
+                    pdf_data = buffer.getvalue()
+                    st.download_button(
+                        label="دانلود PDF",
+                        data=pdf_data,
+                        file_name="tab9_errors.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # چک فونت
+                    if not available_fonts:
+                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab10: تحلیل دیتا -----------
 with tab10:
@@ -1637,7 +1713,7 @@ with tab10:
                 zmin=-1, zmax=1,
                 title="ماتریس همبستگی"
             )
-            st.plotly_chart(fig_corr, use_container_width=True)
+            st.plotly_chart(fig_corr, width='stretch')  # 👈 fix deprecation
 
             st.markdown("**💡 تفسیر همبستگی:**")
             for col in predictor_vars:
@@ -1726,7 +1802,7 @@ with tab10:
                     annotation_text=f"LCL = {LCL:.2f}", annotation_position="bottom right"
                 )
 
-                st.plotly_chart(fig_box, use_container_width=True)
+                st.plotly_chart(fig_box, width='stretch')  # 👈 fix deprecation
 
                 outliers = df_selected[(df_selected[col] > UCL) | (df_selected[col] < LCL)][col]
                 if not outliers.empty:
@@ -1747,113 +1823,116 @@ with tab10:
 
             # خروجی PDF برای Tab10
             if st.button("⬇️ دانلود PDF Tab10"):
-                buffer = io.BytesIO()
-                elements = []
-                
-                # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                img_buf_corr = io.BytesIO()
-                fig_corr.write_image(img_buf_corr, format='png', width=800, height=400, scale=2)
-                img_buf_corr.seek(0)
-                elements.append(Image(img_buf_corr, width=500, height=300))
-                
-                # جدول‌های رگرسیون
-                if single_results:
-                    single_df = pd.DataFrame(single_results)
-                    data_single = [single_df.columns.tolist()] + single_df.values.tolist()
+                if IS_CLOUD:
+                    st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                    html_buf = io.StringIO()
+                    pio.write_html(fig_corr, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                    html_content = html_buf.getvalue().encode('utf-8')
+                    st.download_button("Download HTML Corr", data=html_content, file_name="tab10_corr.html", mime="text/html")
+                else:
+                    buffer = io.BytesIO()
+                    elements = []
                     
-                    # ترجمه هدرها اگر انگلیسی
-                    translations_local = {
-                        "Variable": "Variable",
-                        "R²": "R²",
-                        "p-value": "p-value",
-                        "Impactful": "Impactful"
-                    }
-                    use_persian = available_fonts and font_name != "Helvetica"
-                    if not use_persian and data_single and isinstance(data_single[0], list):
-                        for i, header in enumerate(data_single[0]):
-                            data_single[0][i] = translations_local.get(header, header)
+                    # 👈 Conditional Image
+                    img_buf_corr = io.BytesIO()
+                    try:
+                        fig_corr.write_image(img_buf_corr, format='png', width=800, height=400, scale=2)
+                        img_buf_corr.seek(0)
+                        elements.append(Image(img_buf_corr, width=500, height=300))
+                    except Exception as e:
+                        st.warning(f"Corr export failed: {e}. Use HTML instead.")
                     
-                    # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                    if use_persian:
-                        try:
-                            import arabic_reshaper
-                            from bidi.algorithm import get_display
+                    # جدول‌های رگرسیون
+                    if single_results:
+                        single_df = pd.DataFrame(single_results)
+                        data_single = [single_df.columns.tolist()] + single_df.values.tolist()
+                        
+                        # ترجمه هدرها اگر انگلیسی
+                        translations_local = {
+                            "Variable": "Variable",
+                            "R²": "R²",
+                            "p-value": "p-value",
+                            "Impactful": "Impactful"
+                        }
+                        use_persian = available_fonts and font_name != "Helvetica"
+                        if not use_persian and data_single and isinstance(data_single[0], list):
+                            for i, header in enumerate(data_single[0]):
+                                data_single[0][i] = translations_local.get(header, header)
+                        
+                        # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                        if use_persian and RTL_AVAILABLE:
                             for row in data_single:
                                 for i, cell in enumerate(row):
                                     if isinstance(cell, str):
                                         row[i] = get_display(arabic_reshaper.reshape(cell))
-                        except ImportError:
-                            st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
+                        
+                        table_single = Table(data_single)
+                        table_single.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                            ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                            ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                        ]))
+                        elements.append(table_single)
                     
-                    table_single = Table(data_single)
-                    table_single.setStyle(TableStyle([
-                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                        ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                        ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                    ]))
-                    elements.append(table_single)
-                
-                if 'multi_summary' in locals():
-                    data_multi = [multi_summary.columns.tolist()] + multi_summary.values.tolist()
-                    
-                    # ترجمه هدرها اگر انگلیسی
-                    translations_local = {
-                        "Variable": "Variable",
-                        "Coefficient": "Coefficient",
-                        "p-value": "p-value",
-                        "Significant": "Significant"
-                    }
-                    if not use_persian and data_multi and isinstance(data_multi[0], list):
-                        for i, header in enumerate(data_multi[0]):
-                            data_multi[0][i] = translations_local.get(header, header)
-                    
-                    # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                    if use_persian:
-                        try:
-                            import arabic_reshaper
-                            from bidi.algorithm import get_display
+                    if 'multi_summary' in locals():
+                        data_multi = [multi_summary.columns.tolist()] + multi_summary.values.tolist()
+                        
+                        # ترجمه هدرها اگر انگلیسی
+                        translations_local = {
+                            "Variable": "Variable",
+                            "Coefficient": "Coefficient",
+                            "p-value": "p-value",
+                            "Significant": "Significant"
+                        }
+                        if not use_persian and data_multi and isinstance(data_multi[0], list):
+                            for i, header in enumerate(data_multi[0]):
+                                data_multi[0][i] = translations_local.get(header, header)
+                        
+                        # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                        if use_persian and RTL_AVAILABLE:
                             for row in data_multi:
                                 for i, cell in enumerate(row):
                                     if isinstance(cell, str):
                                         row[i] = get_display(arabic_reshaper.reshape(cell))
-                        except ImportError:
-                            st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
+                        
+                        table_multi = Table(data_multi)
+                        table_multi.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                            ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                            ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                        ]))
+                        elements.append(table_multi)
                     
-                    table_multi = Table(data_multi)
-                    table_multi.setStyle(TableStyle([
-                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                        ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                        ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                    ]))
-                    elements.append(table_multi)
-                
-                # Box Plots
-                for col in predictor_vars + [target_var]:
-                    fig_box_col = px.box(df_selected, y=col, points="all", title=f"Box Plot: {col}")
-                    img_buf_box = io.BytesIO()
-                    fig_box_col.write_image(img_buf_box, format='png', width=800, height=400, scale=2)
-                    img_buf_box.seek(0)
-                    elements.append(Image(img_buf_box, width=500, height=300))
-                
-                title = "تحلیل دیتا"
-                if not use_persian:
-                    title = translations.get(title, title)
-                generate_pdf(title, elements, buffer)
-                
-                # 👈 دانلود با getvalue() برای اطمینان
-                pdf_data = buffer.getvalue()
-                st.download_button(
-                    label="دانلود PDF",
-                    data=pdf_data,
-                    file_name="tab10.pdf",
-                    mime="application/pdf"
-                )
-                
-                # چک فونت
-                if not available_fonts:
-                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                    # Box Plots
+                    for col in predictor_vars + [target_var]:
+                        fig_box_col = px.box(df_selected, y=col, points="all", title=f"Box Plot: {col}")
+                        img_buf_box = io.BytesIO()
+                        try:
+                            fig_box_col.write_image(img_buf_box, format='png', width=800, height=400, scale=2)
+                            img_buf_box.seek(0)
+                            elements.append(Image(img_buf_box, width=500, height=300))
+                        except Exception as e:
+                            st.warning(f"Box plot export failed for {col}: {e}. Use HTML instead.")
+                    
+                    title = "تحلیل دیتا"
+                    if not use_persian:
+                        title = translations.get(title, title)
+                    generate_pdf(title, elements, buffer)
+                    
+                    # 👈 دانلود با getvalue() برای اطمینان
+                    pdf_data = buffer.getvalue()
+                    st.download_button(
+                        label="دانلود PDF",
+                        data=pdf_data,
+                        file_name="tab10.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # چک فونت
+                    if not available_fonts:
+                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
     else:
         st.info("⚠️ لطفاً متغیر وابسته و حداقل یک متغیر مستقل انتخاب کنید تا تحلیل شروع شود.")
 
@@ -1915,7 +1994,7 @@ with tab11:
                 template="plotly_white",
                 height=500
             )
-            st.plotly_chart(fig_anomaly, use_container_width=True)
+            st.plotly_chart(fig_anomaly, width='stretch')  # 👈 fix deprecation
 
             if not anomaly_data.empty:
                 st.warning(f"⚠️ {len(anomaly_data)} ناهنجاری در مصرف {anomaly_col} شناسایی شد!")
@@ -1937,66 +2016,72 @@ with tab11:
 
             # خروجی PDF برای Tab11
             if st.button("⬇️ دانلود PDF Tab11"):
-                buffer = io.BytesIO()
-                elements = []
-                
-                # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                img_buf = io.BytesIO()
-                fig_anomaly.write_image(img_buf, format='png', width=800, height=500, scale=2)
-                img_buf.seek(0)
-                elements.append(Image(img_buf, width=500, height=300))
-                
-                if not anomaly_data.empty:
-                    data = [anomaly_table.columns.tolist()] + anomaly_table.values.tolist()
+                if IS_CLOUD:
+                    st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                    html_buf = io.StringIO()
+                    pio.write_html(fig_anomaly, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                    html_content = html_buf.getvalue().encode('utf-8')
+                    st.download_button("Download HTML", data=html_content, file_name="tab11_chart.html", mime="text/html")
+                else:
+                    buffer = io.BytesIO()
+                    elements = []
                     
-                    # ترجمه هدرها اگر انگلیسی
-                    translations_local = {
-                        "تاریخ": "Date",
-                        "مصرف (MWh)": "Consumption (MWh)"
-                    }
-                    use_persian = available_fonts and font_name != "Helvetica"
-                    if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
-                        data[0][0] = translations_local.get(data[0][0], data[0][0])
-                        data[0][1] = translations_local.get(data[0][1], data[0][1])
+                    # 👈 Conditional Image
+                    img_buf = io.BytesIO()
+                    try:
+                        fig_anomaly.write_image(img_buf, format='png', width=800, height=500, scale=2)
+                        img_buf.seek(0)
+                        elements.append(Image(img_buf, width=500, height=300))
+                    except Exception as e:
+                        st.warning(f"Export failed: {e}. Use HTML instead.")
                     
-                    # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                    if use_persian:
-                        try:
-                            import arabic_reshaper
-                            from bidi.algorithm import get_display
+                    if not anomaly_data.empty:
+                        data = [anomaly_table.columns.tolist()] + anomaly_table.values.tolist()
+                        
+                        # ترجمه هدرها اگر انگلیسی
+                        translations_local = {
+                            "تاریخ": "Date",
+                            "مصرف (MWh)": "Consumption (MWh)"
+                        }
+                        use_persian = available_fonts and font_name != "Helvetica"
+                        if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 2:
+                            data[0][0] = translations_local.get(data[0][0], data[0][0])
+                            data[0][1] = translations_local.get(data[0][1], data[0][1])
+                        
+                        # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                        if use_persian and RTL_AVAILABLE:
                             for row in data:
                                 for i, cell in enumerate(row):
                                     if isinstance(cell, str):
                                         row[i] = get_display(arabic_reshaper.reshape(cell))
-                        except ImportError:
-                            st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
+                        
+                        table = Table(data)
+                        table.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                            ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                            ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                        ]))
+                        elements.append(table)
                     
-                    table = Table(data)
-                    table.setStyle(TableStyle([
-                        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                        ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                        ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                    ]))
-                    elements.append(table)
-                
-                title = "تشخیص ناهنجاری‌ها"
-                if not use_persian:
-                    title = translations.get(title, title)
-                generate_pdf(title, elements, buffer)
-                
-                # 👈 دانلود با getvalue() برای اطمینان
-                pdf_data = buffer.getvalue()
-                st.download_button(
-                    label="دانلود PDF",
-                    data=pdf_data,
-                    file_name="tab11.pdf",
-                    mime="application/pdf"
-                )
-                
-                # چک فونت
-                if not available_fonts:
-                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                    title = "تشخیص ناهنجاری‌ها"
+                    if not use_persian:
+                        title = translations.get(title, title)
+                    generate_pdf(title, elements, buffer)
+                    
+                    # 👈 دانلود با getvalue() برای اطمینان
+                    pdf_data = buffer.getvalue()
+                    st.download_button(
+                        label="دانلود PDF",
+                        data=pdf_data,
+                        file_name="tab11.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # چک فونت
+                    if not available_fonts:
+                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+
 # ----------- Tab12: گزارش زیست‌محیطی (اصلاح‌شده - خروجی HTML نمودارها) -----------
 with tab12:
     st.subheader("🌍 گزارش زیست‌محیطی و پایداری")
@@ -2048,7 +2133,7 @@ with tab12:
             yaxis_title="انتشار CO2 (kg)" if lang_mode == "fa" else "CO2 Emissions (kg)",
             height=500
         )
-        st.plotly_chart(fig_co2, use_container_width=True)
+        st.plotly_chart(fig_co2, width='stretch')  # 👈 fix deprecation
 
         # 🥧 نمودار توزیع بین تجهیزات
         co2_totals = df_env[co2_columns].sum().reset_index()
@@ -2063,7 +2148,7 @@ with tab12:
             title="🥧 توزیع انتشار CO2 بین تجهیزات" if lang_mode == "fa" else "🥧 CO2 Emission Distribution by Equipment",
             template="plotly_white"
         )
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, width='stretch')  # 👈 fix deprecation
 
         # 🔎 محاسبات و تحلیل
         total_co2 = df_env["CO2_Total"].sum()
@@ -2089,54 +2174,72 @@ with tab12:
 
         # 🧾 تولید گزارش PDF
         st.markdown("### 📝 تولید گزارش PDF" if lang_mode == "fa" else "### 📝 Generate PDF Report")
-        buffer = io.BytesIO()
-        elements = []
-
-        elements.append(Paragraph("گزارش زیست‌محیطی و پایداری" if lang_mode=="fa" else "Environmental & Sustainability Report",
-                                  ParagraphStyle('Title', alignment=1 if lang_mode=="fa" else 0)))
-        elements.append(Spacer(1, 12))
-
-        if lang_mode == "fa":
-            summary_data = [
-                ["معیار", "مقدار"],
-                ["کل انتشار CO2 (kg)", f"{total_co2:,.2f}"],
-                ["هدف کاهش CO2 (kg)", f"{target_co2:,.2f}"],
-                ["فاکتور انتشار (kg CO2/kWh)", f"{co2_factor:.2f}"],
-                ["هدف کاهش (%)", f"{reduction_target:.1f}"]
-            ]
+        if IS_CLOUD:
+            st.warning("PDF export limited in cloud. Download HTML charts below.")
         else:
-            summary_data = [
-                ["Metric", "Value"],
-                ["Total CO2 Emissions (kg)", f"{total_co2:,.2f}"],
-                ["Target CO2 (kg)", f"{target_co2:,.2f}"],
-                ["Emission Factor (kg CO2/kWh)", f"{co2_factor:.2f}"],
-                ["Reduction Target (%)", f"{reduction_target:.1f}"]
-            ]
+            buffer = io.BytesIO()
+            elements = []
 
-        table_summary = Table(summary_data)
-        table_summary.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-            ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ]))
-        elements.append(Paragraph("خلاصه معیارهای زیست‌محیطی" if lang_mode=="fa" else "Environmental Summary",
-                                  ParagraphStyle('Normal', alignment=1 if lang_mode=="fa" else 0)))
-        elements.append(Spacer(1, 12))
-        elements.append(table_summary)
+            elements.append(Paragraph("گزارش زیست‌محیطی و پایداری" if lang_mode=="fa" else "Environmental & Sustainability Report",
+                                      ParagraphStyle('Title', alignment=1 if lang_mode=="fa" else 0)))
+            elements.append(Spacer(1, 12))
 
-        # اضافه کردن نمودارها به صورت HTML به جای Image
-        import plotly.io as pio
+            if lang_mode == "fa":
+                summary_data = [
+                    ["معیار", "مقدار"],
+                    ["کل انتشار CO2 (kg)", f"{total_co2:,.2f}"],
+                    ["هدف کاهش CO2 (kg)", f"{target_co2:,.2f}"],
+                    ["فاکتور انتشار (kg CO2/kWh)", f"{co2_factor:.2f}"],
+                    ["هدف کاهش (%)", f"{reduction_target:.1f}"]
+                ]
+            else:
+                summary_data = [
+                    ["Metric", "Value"],
+                    ["Total CO2 Emissions (kg)", f"{total_co2:,.2f}"],
+                    ["Target CO2 (kg)", f"{target_co2:,.2f}"],
+                    ["Emission Factor (kg CO2/kWh)", f"{co2_factor:.2f}"],
+                    ["Reduction Target (%)", f"{reduction_target:.1f}"]
+                ]
 
-        html_buf_co2 = io.StringIO()
+            table_summary = Table(summary_data)
+            table_summary.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
+                ("GRID", (0, 0), (-1, -1), 1, colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ]))
+            elements.append(Paragraph("خلاصه معیارهای زیست‌محیطی" if lang_mode=="fa" else "Environmental Summary",
+                                      ParagraphStyle('Normal', alignment=1 if lang_mode=="fa" else 0)))
+            elements.append(Spacer(1, 12))
+            elements.append(table_summary)
+
+            # ✅ ساخت PDF نهایی
+            title = "گزارش زیست‌محیطی"
+            if not use_persian:
+                title = translations.get(title, title)
+            generate_pdf(title, elements, buffer)
+
+            pdf_data = buffer.getvalue()
+            st.download_button(
+                label="⬇️ دانلود گزارش زیست‌محیطی (PDF)" if lang_mode=="fa" else "⬇️ Download Environmental Report (PDF)",
+                data=pdf_data,
+                file_name="گزارش_زیست_محیطی.pdf" if lang_mode=="fa" else "Environmental_Report.pdf",
+                mime="application/pdf"
+            )
+
+            if not available_fonts:
+                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+
+        # 👈 HTML Export همیشه (fix TypeError)
+        st.markdown("### 🔗 مشاهده نمودارها در مرورگر")
+        html_buf_co2 = io.StringIO()  # 👈 StringIO for HTML
         pio.write_html(fig_co2, file=html_buf_co2, include_plotlyjs='cdn', full_html=False)
-        html_co2 = html_buf_co2.getvalue()
+        html_co2 = html_buf_co2.getvalue().encode('utf-8')  # 👈 encode to bytes
 
         html_buf_pie = io.StringIO()
         pio.write_html(fig_pie, file=html_buf_pie, include_plotlyjs='cdn', full_html=False)
-        html_pie = html_buf_pie.getvalue()
+        html_pie = html_buf_pie.getvalue().encode('utf-8')
 
-        st.markdown("### 🔗 مشاهده نمودارها در مرورگر")
         st.download_button(
             "⬇️ دانلود نمودار روند CO₂ (HTML)" if lang_mode == "fa" else "⬇️ Download CO₂ Trend (HTML)",
             data=html_co2,
@@ -2150,22 +2253,6 @@ with tab12:
             mime="text/html"
         )
 
-        # ✅ ساخت PDF نهایی
-        title = "گزارش زیست‌محیطی"
-        if not use_persian:
-            title = translations.get(title, title)
-        generate_pdf(title, elements, buffer)
-
-        pdf_data = buffer.getvalue()
-        st.download_button(
-            label="⬇️ دانلود گزارش زیست‌محیطی (PDF)" if lang_mode=="fa" else "⬇️ Download Environmental Report (PDF)",
-            data=pdf_data,
-            file_name="گزارش_زیست_محیطی.pdf" if lang_mode=="fa" else "Environmental_Report.pdf",
-            mime="application/pdf"
-        )
-
-        if not available_fonts:
-            st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 # ----------- Tab13: مقایسه با استانداردها -----------
 with tab13:
     st.subheader("🏭 مقایسه با استانداردهای صنعتی")
@@ -2209,7 +2296,7 @@ with tab13:
                     }
                 }
             ))
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.plotly_chart(fig_gauge, width='stretch')  # 👈 fix deprecation
             
             st.metric("مصرف واقعی (kWh/تن)", f"{actual_consumption_per_ton:.2f}")
             st.metric("استاندارد (kWh/تن)", f"{std_value:.2f}")
@@ -2217,32 +2304,42 @@ with tab13:
 
             # خروجی PDF برای Tab13
             if st.button("⬇️ دانلود PDF Tab13"):
-                buffer = io.BytesIO()
-                elements = []
-                
-                # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                img_buf = io.BytesIO()
-                fig_gauge.write_image(img_buf, format='png', width=800, height=400, scale=2)
-                img_buf.seek(0)
-                elements.append(Image(img_buf, width=500, height=300))
-                
-                title = "مقایسه با استانداردهای صنعتی"
-                if not use_persian:
-                    title = translations.get(title, title)
-                generate_pdf(title, elements, buffer)
-                
-                # 👈 دانلود با getvalue() برای اطمینان
-                pdf_data = buffer.getvalue()
-                st.download_button(
-                    label="دانلود PDF",
-                    data=pdf_data,
-                    file_name="tab13.pdf",
-                    mime="application/pdf"
-                )
-                
-                # چک فونت
-                if not available_fonts:
-                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                if IS_CLOUD:
+                    st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                    html_buf = io.StringIO()
+                    pio.write_html(fig_gauge, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                    html_content = html_buf.getvalue().encode('utf-8')
+                    st.download_button("Download HTML", data=html_content, file_name="tab13_chart.html", mime="text/html")
+                else:
+                    buffer = io.BytesIO()
+                    elements = []
+                    
+                    # 👈 Conditional Image
+                    img_buf = io.BytesIO()
+                    try:
+                        fig_gauge.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                        img_buf.seek(0)
+                        elements.append(Image(img_buf, width=500, height=300))
+                    except Exception as e:
+                        st.warning(f"Export failed: {e}. Use HTML instead.")
+                    
+                    title = "مقایسه با استانداردهای صنعتی"
+                    if not use_persian:
+                        title = translations.get(title, title)
+                    generate_pdf(title, elements, buffer)
+                    
+                    # 👈 دانلود با getvalue() برای اطمینان
+                    pdf_data = buffer.getvalue()
+                    st.download_button(
+                        label="دانلود PDF",
+                        data=pdf_data,
+                        file_name="tab13.pdf",
+                        mime="application/pdf"
+                    )
+                    
+                    # چک فونت
+                    if not available_fonts:
+                        st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
     else:
         st.info("📌 نمونه CSV: ستون‌های 'تجهیز' و 'استاندارد kWh/تن'")
 
@@ -2285,74 +2382,79 @@ with tab14:
         )
     )])
     fig_sankey.update_layout(title="جریان هزینه‌ها")
-    st.plotly_chart(fig_sankey, use_container_width=True)
+    st.plotly_chart(fig_sankey, width='stretch')  # 👈 fix deprecation
     
     budget = st.number_input("🎯 بودجه ماهانه (تومان):", value=total_cost * 1.2)
     st.metric("هزینه کل", f"{total_cost:,.0f} تومان", delta=f"{total_cost - budget:.0f}")
 
     # خروجی PDF برای Tab14
     if st.button("⬇️ دانلود PDF Tab14"):
-        buffer = io.BytesIO()
-        elements = []
-        
-        data = [cost_df.columns.tolist()] + cost_df.values.tolist()
-        
-        # ترجمه هدرها اگر انگلیسی
-        translations_local = {
-            "دوره": "Period",
-            "مصرف (kWh)": "Consumption (kWh)",
-            "هزینه (تومان)": "Cost (Toman)"
-        }
-        use_persian = available_fonts and font_name != "Helvetica"
-        if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 3:
-            data[0][0] = translations_local.get(data[0][0], data[0][0])
-            data[0][1] = translations_local.get(data[0][1], data[0][1])
-            data[0][2] = translations_local.get(data[0][2], data[0][2])
-        
-        # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-        if use_persian:
-            try:
-                import arabic_reshaper
-                from bidi.algorithm import get_display
+        if IS_CLOUD:
+            st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+            html_buf = io.StringIO()
+            pio.write_html(fig_sankey, file=html_buf, include_plotlyjs='cdn', full_html=False)
+            html_content = html_buf.getvalue().encode('utf-8')
+            st.download_button("Download HTML", data=html_content, file_name="tab14_chart.html", mime="text/html")
+        else:
+            buffer = io.BytesIO()
+            elements = []
+            
+            data = [cost_df.columns.tolist()] + cost_df.values.tolist()
+            
+            # ترجمه هدرها اگر انگلیسی
+            translations_local = {
+                "دوره": "Period",
+                "مصرف (kWh)": "Consumption (kWh)",
+                "هزینه (تومان)": "Cost (Toman)"
+            }
+            use_persian = available_fonts and font_name != "Helvetica"
+            if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 3:
+                data[0][0] = translations_local.get(data[0][0], data[0][0])
+                data[0][1] = translations_local.get(data[0][1], data[0][1])
+                data[0][2] = translations_local.get(data[0][2], data[0][2])
+            
+            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+            if use_persian and RTL_AVAILABLE:
                 for row in data:
                     for i, cell in enumerate(row):
                         if isinstance(cell, str):
                             row[i] = get_display(arabic_reshaper.reshape(cell))
-            except ImportError:
-                st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-        
-        table = Table(data)
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-            ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-            ('ALIGN', (0,0), (-1,-1), 'CENTER')
-        ]))
-        elements.append(table)
-        
-        # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-        img_buf = io.BytesIO()
-        fig_sankey.write_image(img_buf, format='png', width=800, height=400, scale=2)
-        img_buf.seek(0)
-        elements.append(Image(img_buf, width=500, height=300))
-        
-        title = "تحلیل هزینه و بودجه"
-        if not use_persian:
-            title = translations.get(title, title)
-        generate_pdf(title, elements, buffer)
-        
-        # 👈 دانلود با getvalue() برای اطمینان
-        pdf_data = buffer.getvalue()
-        st.download_button(
-            label="دانلود PDF",
-            data=pdf_data,
-            file_name="tab14.pdf",
-            mime="application/pdf"
-        )
-        
-        # چک فونت
-        if not available_fonts:
-            st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+            
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                ('ALIGN', (0,0), (-1,-1), 'CENTER')
+            ]))
+            elements.append(table)
+            
+            # 👈 Conditional Image
+            img_buf = io.BytesIO()
+            try:
+                fig_sankey.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                img_buf.seek(0)
+                elements.append(Image(img_buf, width=500, height=300))
+            except Exception as e:
+                st.warning(f"Export failed: {e}. Use HTML instead.")
+            
+            title = "تحلیل هزینه و بودجه"
+            if not use_persian:
+                title = translations.get(title, title)
+            generate_pdf(title, elements, buffer)
+            
+            # 👈 دانلود با getvalue() برای اطمینان
+            pdf_data = buffer.getvalue()
+            st.download_button(
+                label="دانلود PDF",
+                data=pdf_data,
+                file_name="tab14.pdf",
+                mime="application/pdf"
+            )
+            
+            # چک فونت
+            if not available_fonts:
+                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab15: داشبورد تعاملی -----------
 with tab15:
@@ -2375,39 +2477,50 @@ with tab15:
             df_quick = filtered_df.groupby(filtered_df["تاریخ"].dt.to_period("M"))[selected_cols].sum().reset_index()
             df_quick["ماه"] = df_quick["تاریخ"].dt.strftime('%Y/%m')
             fig_quick = px.line(df_quick, x="ماه", y=selected_cols, title="روند ماهانه")
-            st.plotly_chart(fig_quick, use_container_width=True)
+            st.plotly_chart(fig_quick, width='stretch')  # 👈 fix deprecation
     
     st.info("🔄 داشبورد هر ۳۰ ثانیه رفرش می‌شود (در محیط واقعی).")
 
     # خروجی PDF برای Tab15
     if st.button("⬇️ دانلود PDF Tab15"):
-        buffer = io.BytesIO()
-        elements = []
-        
-        if view_selector == "روند سریع":
-            # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-            img_buf = io.BytesIO()
-            fig_quick.write_image(img_buf, format='png', width=800, height=400, scale=2)
-            img_buf.seek(0)
-            elements.append(Image(img_buf, width=500, height=300))
-        
-        title = "داشبورد تعاملی زنده"
-        if not use_persian:
-            title = translations.get(title, title)
-        generate_pdf(title, elements, buffer)
-        
-        # 👈 دانلود با getvalue() برای اطمینان
-        pdf_data = buffer.getvalue()
-        st.download_button(
-            label="دانلود PDF",
-            data=pdf_data,
-            file_name="tab15.pdf",
-            mime="application/pdf"
-        )
-        
-        # چک فونت
-        if not available_fonts:
-            st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+        if IS_CLOUD:
+            st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+            if view_selector == "روند سریع":
+                html_buf = io.StringIO()
+                pio.write_html(fig_quick, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                html_content = html_buf.getvalue().encode('utf-8')
+                st.download_button("Download HTML", data=html_content, file_name="tab15_chart.html", mime="text/html")
+        else:
+            buffer = io.BytesIO()
+            elements = []
+            
+            if view_selector == "روند سریع":
+                # 👈 Conditional Image
+                img_buf = io.BytesIO()
+                try:
+                    fig_quick.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                    img_buf.seek(0)
+                    elements.append(Image(img_buf, width=500, height=300))
+                except Exception as e:
+                    st.warning(f"Export failed: {e}. Use HTML instead.")
+            
+            title = "داشبورد تعاملی زنده"
+            if not use_persian:
+                title = translations.get(title, title)
+            generate_pdf(title, elements, buffer)
+            
+            # 👈 دانلود با getvalue() برای اطمینان
+            pdf_data = buffer.getvalue()
+            st.download_button(
+                label="دانلود PDF",
+                data=pdf_data,
+                file_name="tab15.pdf",
+                mime="application/pdf"
+            )
+            
+            # چک فونت
+            if not available_fonts:
+                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
 
 # ----------- Tab16: گزارش‌های سفارشی (داره، تغییر فونت) -----------
 with tab16:
@@ -2448,130 +2561,137 @@ with tab16:
             st.error("⚠️ حداقل یک تجهیز انتخاب کنید!")
             st.stop()
         
-        buffer = io.BytesIO()
-        elements = []
-        
-        use_persian = available_fonts and font_name != "Helvetica"
-        if font_path_tab16 and os.path.exists(font_path_tab16):
-            try:
-                pdfmetrics.registerFont(TTFont("BNazanin", font_path_tab16))
-                title_style = ParagraphStyle(
-                    name='TitleRTL',
-                    parent=getSampleStyleSheet()['Title'],
-                    fontName="BNazanin",
-                    fontSize=18,
-                    alignment=1
-                )
-                normal_style = ParagraphStyle(
-                    name='RTLStyle',
-                    parent=getSampleStyleSheet()['Normal'],
-                    fontName="BNazanin",
-                    fontSize=12,
-                    leading=14,
-                    alignment=1,
-                    spaceAfter=12
-                )
-                st.success("✅ فونت B Nazanin ثبت شد.")
-            except Exception as e:
-                st.error(f"⚠️ خطا در فونت: {e}")
+        if IS_CLOUD:
+            st.warning("PDF export limited in cloud. Download data as CSV instead.")
+            csv = filtered_report_df.to_csv(index=False).encode('utf-8')
+            st.download_button("Download CSV", data=csv, file_name="report.csv", mime="text/csv")
+        else:
+            buffer = io.BytesIO()
+            elements = []
+            
+            use_persian = available_fonts and font_name != "Helvetica"
+            if font_path_tab16 and os.path.exists(font_path_tab16):
+                try:
+                    pdfmetrics.registerFont(TTFont("BNazanin", font_path_tab16))
+                    title_style = ParagraphStyle(
+                        name='TitleRTL',
+                        parent=getSampleStyleSheet()['Title'],
+                        fontName="BNazanin",
+                        fontSize=18,
+                        alignment=1
+                    )
+                    normal_style = ParagraphStyle(
+                        name='RTLStyle',
+                        parent=getSampleStyleSheet()['Normal'],
+                        fontName="BNazanin",
+                        fontSize=12,
+                        leading=14,
+                        alignment=1,
+                        spaceAfter=12
+                    )
+                    st.success("✅ فونت B Nazanin ثبت شد.")
+                except Exception as e:
+                    st.error(f"⚠️ خطا در فونت: {e}")
+                    title_style = getSampleStyleSheet()['Title']
+                    normal_style = getSampleStyleSheet()['Normal']
+            else:
                 title_style = getSampleStyleSheet()['Title']
                 normal_style = getSampleStyleSheet()['Normal']
-        else:
-            title_style = getSampleStyleSheet()['Title']
-            normal_style = getSampleStyleSheet()['Normal']
-        
-        title_text = f"گزارش سفارشی پایش برق ({JalaliDate(start_date).strftime('%Y/%m/%d')} تا {JalaliDate(end_date).strftime('%Y/%m/%d')})"
-        elements.append(Paragraph(title_text, title_style))
-        elements.append(Spacer(1, 12))
-        
-        if include_kpi:
-            elements.append(Paragraph("جدول KPI", normal_style))
-            if granularity == "روزانه":
-                kpi_summary = filtered_report_df[selected_cols_report].sum()
-                kpi_data = [['تجهیز', 'مجموع بازه']] + [[col, f"{kpi_summary[col]:.2f}"] for col in selected_cols_report]
-            else:
-                filtered_report_df["ماه شمسی"] = filtered_report_df["تاریخ"].map(lambda x: JalaliDate(x).strftime('%Y/%m'))
-                kpi_monthly = filtered_report_df.groupby("ماه شمسی")[selected_cols_report].sum()
-                kpi_data = [['تجهیز', 'مجموع بازه']] + [[col, f"{kpi_monthly[col].sum():.2f}"] for col in selected_cols_report]
             
-            # ترجمه هدرها اگر انگلیسی
-            translations_local = {
-                "تجهیز": "Equipment",
-                "مجموع بازه": "Total Period"
-            }
-            if not use_persian and kpi_data and isinstance(kpi_data[0], list):
-                kpi_data[0][0] = translations_local.get(kpi_data[0][0], kpi_data[0][0])
-                kpi_data[0][1] = translations_local.get(kpi_data[0][1], kpi_data[0][1])
+            title_text = f"گزارش سفارشی پایش برق ({JalaliDate(start_date).strftime('%Y/%m/%d')} تا {JalaliDate(end_date).strftime('%Y/%m/%d')})"
+            elements.append(Paragraph(title_text, title_style))
+            elements.append(Spacer(1, 12))
             
-            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-            if use_persian:
-                try:
-                    import arabic_reshaper
-                    from bidi.algorithm import get_display
+            if include_kpi:
+                elements.append(Paragraph("جدول KPI", normal_style))
+                if granularity == "روزانه":
+                    kpi_summary = filtered_report_df[selected_cols_report].sum()
+                    kpi_data = [['تجهیز', 'مجموع بازه']] + [[col, f"{kpi_summary[col]:.2f}"] for col in selected_cols_report]
+                else:
+                    filtered_report_df["ماه شمسی"] = filtered_report_df["تاریخ"].map(lambda x: JalaliDate(x).strftime('%Y/%m'))
+                    kpi_monthly = filtered_report_df.groupby("ماه شمسی")[selected_cols_report].sum()
+                    kpi_data = [['تجهیز', 'مجموع بازه']] + [[col, f"{kpi_monthly[col].sum():.2f}"] for col in selected_cols_report]
+                
+                # ترجمه هدرها اگر انگلیسی
+                translations_local = {
+                    "تجهیز": "Equipment",
+                    "مجموع بازه": "Total Period"
+                }
+                if not use_persian and kpi_data and isinstance(kpi_data[0], list):
+                    kpi_data[0][0] = translations_local.get(kpi_data[0][0], kpi_data[0][0])
+                    kpi_data[0][1] = translations_local.get(kpi_data[0][1], kpi_data[0][1])
+                
+                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                if use_persian and RTL_AVAILABLE:
                     for row in kpi_data:
                         for i, cell in enumerate(row):
                             if isinstance(cell, str):
                                 row[i] = get_display(arabic_reshaper.reshape(cell))
-                except ImportError:
-                    st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-            
-            table = Table(kpi_data)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), colors.lightblue),
-                ('TEXTCOLOR', (0,0), (-1,-1), colors.black),
-                ('GRID', (0,0), (-1,-1), 1, colors.darkblue),
-                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-            ]))
-            elements.append(table)
-            elements.append(Spacer(1, 12))
-        
-        if include_trend:
-            elements.append(Paragraph(f"نمودار روند مصرف ({granularity})", normal_style))
-            
-            df_trend = filtered_report_df.copy()
-            if granularity == "روزانه":
-                df_trend["تاریخ نمایش"] = df_trend["تاریخ"].map(lambda x: JalaliDate(x).strftime('%Y/%m/%d'))
-                df_trend = df_trend.groupby("تاریخ نمایش")[selected_cols_report].mean().reset_index()
-            else:
-                df_trend["تاریخ نمایش"] = df_trend["تاریخ"].map(lambda x: JalaliDate(x).strftime('%Y/%m'))
-                df_trend = df_trend.groupby("تاریخ نمایش")[selected_cols_report].mean().reset_index()
-            
-            if not df_trend.empty:
-                fig_trend = px.line(
-                    df_trend, 
-                    x="تاریخ نمایش", 
-                    y=selected_cols_report, 
-                    title=f"روند مصرف ({granularity})",
-                    color_discrete_sequence=px.colors.qualitative.Set1
-                )
-                fig_trend.update_layout(
-                    xaxis_title="تاریخ شمسی", 
-                    yaxis_title="میانگین مصرف (MWh)", 
-                    plot_bgcolor='white', 
-                    paper_bgcolor='white'
-                )
                 
-                st.plotly_chart(fig_trend, use_container_width=True)
-                
-                img_buffer = io.BytesIO()
-                fig_trend.write_image(img_buffer, format='png', width=500, height=300, scale=2)
-                img_buffer.seek(0)
-                
-                img = Image(img_buffer, width=500, height=300)
-                elements.append(img)
+                table = Table(kpi_data)
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.lightblue),
+                    ('TEXTCOLOR', (0,0), (-1,-1), colors.black),
+                    ('GRID', (0,0), (-1,-1), 1, colors.darkblue),
+                    ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ]))
+                elements.append(table)
                 elements.append(Spacer(1, 12))
-        
-        title = "گزارش سفارشی"
-        if not use_persian:
-            title = translations.get(title, title)
-        generate_pdf(title, elements, buffer)
-        
-        # 👈 دانلود با getvalue() برای اطمینان
-        pdf_data = buffer.getvalue()
-        st.download_button("⬇️ دانلود PDF", pdf_data, "گزارش_سفارشی.pdf", "application/pdf")
-        
-        if uploaded_font:
-            os.remove("temp_font_tab16.ttf")
+            
+            if include_trend:
+                elements.append(Paragraph(f"نمودار روند مصرف ({granularity})", normal_style))
+                
+                df_trend = filtered_report_df.copy()
+                if granularity == "روزانه":
+                    df_trend["تاریخ نمایش"] = df_trend["تاریخ"].map(lambda x: JalaliDate(x).strftime('%Y/%m/%d'))
+                    df_trend = df_trend.groupby("تاریخ نمایش")[selected_cols_report].mean().reset_index()
+                else:
+                    df_trend["تاریخ نمایش"] = df_trend["تاریخ"].map(lambda x: JalaliDate(x).strftime('%Y/%m'))
+                    df_trend = df_trend.groupby("تاریخ نمایش")[selected_cols_report].mean().reset_index()
+                
+                if not df_trend.empty:
+                    fig_trend = px.line(
+                        df_trend, 
+                        x="تاریخ نمایش", 
+                        y=selected_cols_report, 
+                        title=f"روند مصرف ({granularity})",
+                        color_discrete_sequence=px.colors.qualitative.Set1
+                    )
+                    fig_trend.update_layout(
+                        xaxis_title="تاریخ شمسی", 
+                        yaxis_title="میانگین مصرف (MWh)", 
+                        plot_bgcolor='white', 
+                        paper_bgcolor='white'
+                    )
+                    
+                    st.plotly_chart(fig_trend, width='stretch')  # 👈 fix deprecation
+                    
+                    # 👈 Conditional Image
+                    img_buffer = io.BytesIO()
+                    try:
+                        fig_trend.write_image(img_buffer, format='png', width=500, height=300, scale=2)
+                        img_buffer.seek(0)
+                        img = Image(img_buffer, width=500, height=300)
+                        elements.append(img)
+                    except Exception as e:
+                        st.warning(f"Trend export failed: {e}. Use HTML instead.")
+                    elements.append(Spacer(1, 12))
+            
+            title = "گزارش سفارشی"
+            if not use_persian:
+                title = translations.get(title, title)
+            generate_pdf(title, elements, buffer)
+            
+            # 👈 دانلود با getvalue() برای اطمینان
+            pdf_data = buffer.getvalue()
+            st.download_button("⬇️ دانلود PDF", pdf_data, "گزارش_سفارشی.pdf", "application/pdf")
+            
+            # 👈 Fix os.remove: ignore in cloud
+            if uploaded_font and os.path.exists("temp_font_tab16.ttf"):
+                try:
+                    os.remove("temp_font_tab16.ttf")
+                except:
+                    pass  # Ignore in cloud
     
     if st.checkbox("📱 ارسال به واتساپ"):
         phone_number = st.text_input("📞 شماره واتساپ (با +، مثل +989123456789):")
@@ -2585,7 +2705,8 @@ with tab16:
             import pywhatkit as pwk
             pwk.sendwhatmsg_instantly(phone_number, message)
             st.success("✅ پیام به واتساپ ارسال شد! (PDF رو دانلود و دستی ضمیمه کن.)")
-            st.download_button("📎 دانلود PDF برای واتساپ", pdf_data, "گزارش.pdf", "application/pdf")
+            if 'pdf_data' in locals():
+                st.download_button("📎 دانلود PDF برای واتساپ", pdf_data, "گزارش.pdf", "application/pdf")
 
 # ----------- Tab17: شبیه‌سازی سناریوها (داره، تغییر فونت) -----------
 with tab17:
@@ -2604,7 +2725,7 @@ with tab17:
         for col in selected_scen:
             fig_hist = px.histogram(sim_df, x=col, title=f"توزیع شبیه‌سازی {col} (±{change_factor}%)",
                                     color_discrete_sequence=['blue'])
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width='stretch')  # 👈 fix deprecation
         
         summary = sim_df.describe().round(2)
         st.dataframe(summary)
@@ -2625,98 +2746,106 @@ with tab17:
                 st.warning("⚠️ فونت B Nazanin پیدا نشد.")
         
         if st.button("تولید PDF", key="sim_pdf"):
-            pdf_buffer = io.BytesIO()
-            elements = []
-            
-            use_persian = available_fonts and font_name != "Helvetica"
-            if font_path_sim and os.path.exists(font_path_sim):
-                try:
-                    pdfmetrics.registerFont(TTFont("BNazanin", font_path_sim))
-                    title_style = ParagraphStyle(
-                        name='TitleRTL',
-                        parent=getSampleStyleSheet()['Title'],
-                        fontName="BNazanin",
-                        fontSize=18,
-                        alignment=1
-                    )
-                    normal_style = ParagraphStyle(
-                        name='RTLStyle',
-                        parent=getSampleStyleSheet()['Normal'],
-                        fontName="BNazanin",
-                        fontSize=12,
-                        leading=14,
-                        alignment=1,
-                        spaceAfter=12
-                    )
-                except Exception as e:
-                    st.error(f"⚠️ خطا در فونت: {e}")
+            if IS_CLOUD:
+                st.warning("PDF export limited in cloud. Download CSV instead.")
+                csv = summary.to_csv().encode('utf-8')
+                st.download_button("Download CSV", data=csv, file_name="simulation.csv", mime="text/csv")
+            else:
+                pdf_buffer = io.BytesIO()
+                elements = []
+                
+                use_persian = available_fonts and font_name != "Helvetica"
+                if font_path_sim and os.path.exists(font_path_sim):
+                    try:
+                        pdfmetrics.registerFont(TTFont("BNazanin", font_path_sim))
+                        title_style = ParagraphStyle(
+                            name='TitleRTL',
+                            parent=getSampleStyleSheet()['Title'],
+                            fontName="BNazanin",
+                            fontSize=18,
+                            alignment=1
+                        )
+                        normal_style = ParagraphStyle(
+                            name='RTLStyle',
+                            parent=getSampleStyleSheet()['Normal'],
+                            fontName="BNazanin",
+                            fontSize=12,
+                            leading=14,
+                            alignment=1,
+                            spaceAfter=12
+                        )
+                    except Exception as e:
+                        st.error(f"⚠️ خطا در فونت: {e}")
+                        title_style = getSampleStyleSheet()['Title']
+                        normal_style = getSampleStyleSheet()['Normal']
+                else:
                     title_style = getSampleStyleSheet()['Title']
                     normal_style = getSampleStyleSheet()['Normal']
-            else:
-                title_style = getSampleStyleSheet()['Title']
-                normal_style = getSampleStyleSheet()['Normal']
-            
-            title_text = f"گزارش شبیه‌سازی مونت‌کارلو (±{change_factor}%) - {n_simulations} تکرار"
-            elements.append(Paragraph(title_text, title_style))
-            elements.append(Spacer(1, 12))
-            
-            elements.append(Paragraph("جدول آمار توصیفی", normal_style))
-            summary_list = summary.reset_index().values.tolist()
-            
-            # ترجمه هدرها اگر انگلیسی
-            translations_local = {
-                # Add summary columns translations if needed
-            }
-            if not use_persian and summary_list and isinstance(summary_list[0], list):
-                # Apply translations to headers
-                pass  # Implement as needed
-            
-            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-            if use_persian:
-                try:
-                    import arabic_reshaper
-                    from bidi.algorithm import get_display
+                
+                title_text = f"گزارش شبیه‌سازی مونت‌کارلو (±{change_factor}%) - {n_simulations} تکرار"
+                elements.append(Paragraph(title_text, title_style))
+                elements.append(Spacer(1, 12))
+                
+                elements.append(Paragraph("جدول آمار توصیفی", normal_style))
+                summary_list = summary.reset_index().values.tolist()
+                
+                # ترجمه هدرها اگر انگلیسی
+                translations_local = {
+                    # Add summary columns translations if needed
+                }
+                if not use_persian and summary_list and isinstance(summary_list[0], list):
+                    # Apply translations to headers
+                    pass  # Implement as needed
+                
+                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                if use_persian and RTL_AVAILABLE:
                     for row in summary_list:
                         for i, cell in enumerate(row):
                             if isinstance(cell, str):
                                 row[i] = get_display(arabic_reshaper.reshape(cell))
-                except ImportError:
-                    st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-            
-            table = Table(summary_list)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), colors.lightblue),
-                ('TEXTCOLOR', (0,0), (-1,-1), colors.black),
-                ('GRID', (0,0), (-1,-1), 1, colors.darkblue),
-                ('ALIGN', (0,0), (-1,-1), 'CENTER')
-            ]))
-            elements.append(table)
-            elements.append(Spacer(1, 12))
-            
-            for col in selected_scen:
-                fig_hist_pdf = px.histogram(sim_df, x=col, title=f"توزیع {col}",
-                                            color_discrete_sequence=['blue'])
-                fig_hist_pdf.update_layout(plot_bgcolor='white', paper_bgcolor='white')
                 
-                img_buffer = io.BytesIO()
-                fig_hist_pdf.write_image(img_buffer, format='png', width=500, height=300, scale=2)
-                img_buffer.seek(0)
-                img = Image(img_buffer, width=500, height=300)
-                elements.append(Paragraph(f"هیستوگرام {col}", normal_style))
-                elements.append(img)
+                table = Table(summary_list)
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.lightblue),
+                    ('TEXTCOLOR', (0,0), (-1,-1), colors.black),
+                    ('GRID', (0,0), (-1,-1), 1, colors.darkblue),
+                    ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                ]))
+                elements.append(table)
                 elements.append(Spacer(1, 12))
-            
-            title = "شبیه‌سازی سناریوها"
-            if not use_persian:
-                title = translations.get(title, title)
-            generate_pdf(title, elements, pdf_buffer)
-            
-            # 👈 دانلود با getvalue() برای اطمینان
-            pdf_data = pdf_buffer.getvalue()
-            st.download_button("⬇️ دانلود PDF شبیه‌سازی", pdf_data, "شبیه_سازی_مونت_کارلو.pdf", "application/pdf")
-            
-            if uploaded_font_sim:
-                os.remove("temp_sim_font.ttf")
+                
+                for col in selected_scen:
+                    fig_hist_pdf = px.histogram(sim_df, x=col, title=f"توزیع {col}",
+                                                color_discrete_sequence=['blue'])
+                    fig_hist_pdf.update_layout(plot_bgcolor='white', paper_bgcolor='white')
+                    
+                    # 👈 Conditional Image
+                    img_buffer = io.BytesIO()
+                    try:
+                        fig_hist_pdf.write_image(img_buffer, format='png', width=500, height=300, scale=2)
+                        img_buffer.seek(0)
+                        img = Image(img_buffer, width=500, height=300)
+                        elements.append(Paragraph(f"هیستوگرام {col}", normal_style))
+                        elements.append(img)
+                    except Exception as e:
+                        st.warning(f"Hist export failed for {col}: {e}. Use HTML instead.")
+                    elements.append(Spacer(1, 12))
+                
+                title = "شبیه‌سازی سناریوها"
+                if not use_persian:
+                    title = translations.get(title, title)
+                generate_pdf(title, elements, pdf_buffer)
+                
+                # 👈 دانلود با getvalue() برای اطمینان
+                pdf_data = pdf_buffer.getvalue()
+                st.download_button("⬇️ دانلود PDF شبیه‌سازی", pdf_data, "شبیه_سازی_مونت_کارلو.pdf", "application/pdf")
+                
+                # 👈 Fix os.remove: ignore in cloud
+                if uploaded_font_sim and os.path.exists("temp_sim_font.ttf"):
+                    try:
+                        os.remove("temp_sim_font.ttf")
+                    except:
+                        pass  # Ignore in cloud
 
 # ----------- Tab18: بهینه‌سازی -----------
 with tab18:
@@ -2756,71 +2885,76 @@ with tab18:
                     st.metric("هزینه کل بهینه", f"{total_cost:.0f} تومان")
                     
                     fig = px.bar(res_df, x="تجهیز", y="مصرف بهینه (MWh)", title="تخصیص بهینه")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')  # 👈 fix deprecation
 
                     # خروجی PDF برای Tab18 LP
                     if st.button("⬇️ دانلود PDF LP Tab18"):
-                        buffer = io.BytesIO()
-                        elements = []
-                        
-                        data = [res_df.columns.tolist()] + res_df.values.tolist()
-                        
-                        # ترجمه هدرها اگر انگلیسی
-                        translations_local = {
-                            "تجهیز": "Equipment",
-                            "مصرف بهینه (MWh)": "Optimized Consumption (MWh)",
-                            "هزینه (تومان)": "Cost (Toman)"
-                        }
-                        use_persian = available_fonts and font_name != "Helvetica"
-                        if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 3:
-                            data[0][0] = translations_local.get(data[0][0], data[0][0])
-                            data[0][1] = translations_local.get(data[0][1], data[0][1])
-                            data[0][2] = translations_local.get(data[0][2], data[0][2])
-                        
-                        # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-                        if use_persian:
-                            try:
-                                import arabic_reshaper
-                                from bidi.algorithm import get_display
+                        if IS_CLOUD:
+                            st.warning("PDF/Image export limited in cloud. Download HTML charts instead.")
+                            html_buf = io.StringIO()
+                            pio.write_html(fig, file=html_buf, include_plotlyjs='cdn', full_html=False)
+                            html_content = html_buf.getvalue().encode('utf-8')
+                            st.download_button("Download HTML", data=html_content, file_name="tab18_lp_chart.html", mime="text/html")
+                        else:
+                            buffer = io.BytesIO()
+                            elements = []
+                            
+                            data = [res_df.columns.tolist()] + res_df.values.tolist()
+                            
+                            # ترجمه هدرها اگر انگلیسی
+                            translations_local = {
+                                "تجهیز": "Equipment",
+                                "مصرف بهینه (MWh)": "Optimized Consumption (MWh)",
+                                "هزینه (تومان)": "Cost (Toman)"
+                            }
+                            use_persian = available_fonts and font_name != "Helvetica"
+                            if not use_persian and data and isinstance(data[0], list) and len(data[0]) >= 3:
+                                data[0][0] = translations_local.get(data[0][0], data[0][0])
+                                data[0][1] = translations_local.get(data[0][1], data[0][1])
+                                data[0][2] = translations_local.get(data[0][2], data[0][2])
+                            
+                            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                            if use_persian and RTL_AVAILABLE:
                                 for row in data:
                                     for i, cell in enumerate(row):
                                         if isinstance(cell, str):
                                             row[i] = get_display(arabic_reshaper.reshape(cell))
-                            except ImportError:
-                                st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-                        
-                        table = Table(data)
-                        table.setStyle(TableStyle([
-                            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
-                            ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
-                            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
-                            ('ALIGN', (0,0), (-1,-1), 'CENTER')
-                        ]))
-                        elements.append(table)
-                        
-                        # تولید تصویر با کیفیت بهتر (نیاز به kaleido: pip install kaleido)
-                        img_buf = io.BytesIO()
-                        fig.write_image(img_buf, format='png', width=800, height=400, scale=2)
-                        img_buf.seek(0)
-                        elements.append(Image(img_buf, width=500, height=300))
-                        
-                        title = "بهینه‌سازی LP"
-                        if not use_persian:
-                            title = translations.get(title, title)
-                        generate_pdf(title, elements, buffer)
-                        
-                        # 👈 دانلود با getvalue() برای اطمینان
-                        pdf_data = buffer.getvalue()
-                        st.download_button(
-                            label="دانلود PDF",
-                            data=pdf_data,
-                            file_name="tab18_lp.pdf",
-                            mime="application/pdf"
-                        )
-                        
-                        # چک فونت
-                        if not available_fonts:
-                            st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                            
+                            table = Table(data)
+                            table.setStyle(TableStyle([
+                                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),  # پس‌زمینه عنوان
+                                ('TEXTCOLOR', (0,0), (-1,0), colors.black),       # متن عنوان
+                                ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),  # 👈 grid کم‌رنگ (نه مشکی)
+                                ('ALIGN', (0,0), (-1,-1), 'CENTER')
+                            ]))
+                            elements.append(table)
+                            
+                            # 👈 Conditional Image
+                            img_buf = io.BytesIO()
+                            try:
+                                fig.write_image(img_buf, format='png', width=800, height=400, scale=2)
+                                img_buf.seek(0)
+                                elements.append(Image(img_buf, width=500, height=300))
+                            except Exception as e:
+                                st.warning(f"Export failed: {e}. Use HTML instead.")
+                            
+                            title = "بهینه‌سازی LP"
+                            if not use_persian:
+                                title = translations.get(title, title)
+                            generate_pdf(title, elements, buffer)
+                            
+                            # 👈 دانلود با getvalue() برای اطمینان
+                            pdf_data = buffer.getvalue()
+                            st.download_button(
+                                label="دانلود PDF",
+                                data=pdf_data,
+                                file_name="tab18_lp.pdf",
+                                mime="application/pdf"
+                            )
+                            
+                            # چک فونت
+                            if not available_fonts:
+                                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
                 else:
                     st.error("راه‌حل بهینه پیدا نشد!")
     
@@ -2840,43 +2974,41 @@ with tab18:
 
         # خروجی PDF برای Tab18 NLP
         if st.button("⬇️ دانلود PDF NLP Tab18"):
-            buffer = io.BytesIO()
-            elements = []
-            
-            # ترجمه هدرها اگر انگلیسی
-            translations_local = {
-                # For text
-            }
-            use_persian = available_fonts and font_name != "Helvetica"
-            text = f"نتایج NLP: x={res.x[0]:.2f}, y={res.x[1]:.2f}, مقدار هدف={res.fun:.2f}"
-            if not use_persian:
-                text = "NLP Results: x={:.2f}, y={:.2f}, objective={:.2f}".format(res.x[0], res.x[1], res.fun)
-            
-            # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
-            if use_persian:
-                try:
-                    import arabic_reshaper
-                    from bidi.algorithm import get_display
+            if IS_CLOUD:
+                st.warning("PDF export limited in cloud.")
+            else:
+                buffer = io.BytesIO()
+                elements = []
+                
+                # ترجمه هدرها اگر انگلیسی
+                translations_local = {
+                    # For text
+                }
+                use_persian = available_fonts and font_name != "Helvetica"
+                text = f"نتایج NLP: x={res.x[0]:.2f}, y={res.x[1]:.2f}, مقدار هدف={res.fun:.2f}"
+                if not use_persian:
+                    text = "NLP Results: x={:.2f}, y={:.2f}, objective={:.2f}".format(res.x[0], res.x[1], res.fun)
+                
+                # Reshape متن‌ها برای RTL اگر فارسی (فقط رشته‌ها)
+                if use_persian and RTL_AVAILABLE:
                     text = get_display(arabic_reshaper.reshape(text))
-                except ImportError:
-                    st.warning("برای RTL در جدول، arabic-reshaper و python-bidi رو نصب کن.")
-            
-            elements.append(Paragraph(text, ParagraphStyle('Normal', alignment=1 if use_persian else 0)))
-            
-            title = "بهینه‌سازی NLP"
-            if not use_persian:
-                title = translations.get(title, title)
-            generate_pdf(title, elements, buffer)
-            
-            # 👈 دانلود با getvalue() برای اطمینان
-            pdf_data = buffer.getvalue()
-            st.download_button(
-                label="دانلود PDF",
-                data=pdf_data,
-                file_name="tab18_nlp.pdf",
-                mime="application/pdf"
-            )
-            
-            # چک فونت
-            if not available_fonts:
-                st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
+                
+                elements.append(Paragraph(text, ParagraphStyle('Normal', alignment=1 if use_persian else 0)))
+                
+                title = "بهینه‌سازی NLP"
+                if not use_persian:
+                    title = translations.get(title, title)
+                generate_pdf(title, elements, buffer)
+                
+                # 👈 دانلود با getvalue() برای اطمینان
+                pdf_data = buffer.getvalue()
+                st.download_button(
+                    label="دانلود PDF",
+                    data=pdf_data,
+                    file_name="tab18_nlp.pdf",
+                    mime="application/pdf"
+                )
+                
+                # چک فونت
+                if not available_fonts:
+                    st.warning("⚠️ فونت فارسی پیدا نشد. PDF به انگلیسی تولید شد.")
